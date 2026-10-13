@@ -272,6 +272,7 @@ async function renderProject(slug) {
   const base = `/api/projects/${encodeURIComponent(p.slug)}`;
   const linkLines = p.links.split('\n').map(l => l.trim()).filter(Boolean);
   const logFilter = pref.logFilter || 'all';
+  const showDone = !!pref.showDoneTasks;
   const pick = { all: () => true, mine: n => !isAgent(n) && n.kind === 'note', agents: isAgent };
   const counts = { mine: p.notes.filter(pick.mine).length, agents: p.notes.filter(pick.agents).length };
   const notes = p.notes.filter(pick[logFilter] || pick.all);
@@ -310,8 +311,9 @@ async function renderProject(slug) {
       </section>
 
       <section class="panel a-tasks">
-        <h2>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</h2>
-        <ul class="tasks">${p.tasks.map(t => `
+        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span>${p.tasks_done ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${p.tasks_done})`}</button>` : ''}</h2>
+        ${!showDone && p.tasks_total && p.tasks_total === p.tasks_done ? `<p class="empty">All done.</p>` : ''}
+        <ul class="tasks">${p.tasks.filter(t => showDone || !t.done).map(t => `
           <li class="${t.done ? 'done' : ''}">
             <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
             <span class="t">${rich(t.text)}</span>
@@ -410,6 +412,8 @@ async function renderProject(slug) {
   });
 
   // Tasks
+  const sd = app.querySelector('[data-showdone]');
+  if (sd) sd.onclick = () => { pref.showDoneTasks = !showDone; savePref(); renderProject(p.slug); };
   app.querySelectorAll('[data-task]').forEach(cb => cb.onchange = () => guard(async () => {
     await api('PATCH', `/api/tasks/${cb.dataset.task}`, { done: cb.checked });
     renderProject(p.slug);
