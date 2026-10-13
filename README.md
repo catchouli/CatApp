@@ -1,125 +1,65 @@
 # CatApp
 
-A small personal organiser that runs on your Mac and works from your phone. Projects (personal, work, whatever you like), each with a status, a next step, a checklist and a dated log of notes, plus a to-do list and an optional Claude assistant. One SQLite file, three ways in:
+<a href="docs/screenshots/home.png"><img src="docs/screenshots/home.png" width="49%"></a>
+<a href="docs/screenshots/assistant.jpg"><img src="docs/screenshots/assistant.jpg" width="49%"></a>
+<a href="docs/screenshots/project.png"><img src="docs/screenshots/project.png" width="49%"></a>
+<a href="docs/screenshots/phone.png"><img src="docs/screenshots/phone.png" width="18%"></a>
 
-- **Web app** in any browser on your network, including phones
-- **CLI**: `catapp note blender "finished the donut"`
-- **MCP server** so AI agents (Claude Code and others) can read it and post updates
+A little personal organiser for keeping track of my life and all my projects.
 
-It's called CatApp because Cat made it. Name your copy whatever you like (see below).
+I've always got far too many things on the go (side projects, work ideas, learning
+things, life admin) and I'm not very organised. I'd start something, get distracted,
+and a month later have no idea where I'd left it. Every to-do app I tried was either too
+much faff or didn't know about the coding projects I spend most of my time on, so I
+made my own.
 
-## Run your own copy (macOS)
+Every project gets a status, a next step, a checklist and a log of dated notes, so
+picking something back up is just a case of reading what past me wrote. There's a
+to-do list on the front page for everything else.
 
-1. **Install Rust** if you don't have it: <https://rustup.rs>
-2. **Build and install** from this folder:
-   ```sh
-   cargo install --path .
-   ```
-   This puts the `catapp` command in `~/.cargo/bin`.
-3. **Make it yours:**
-   ```sh
-   catapp config name MaisyApp     # the app's name
-   catapp config owner Maisy       # your first name (the assistant uses it)
-   catapp config                   # check
-   ```
-   The icon is a cat for CatApp and a plain tick otherwise. `catapp config icon cat` if you want the cat anyway.
-4. **Run it in the background** (starts at login, restarts if it crashes):
-   ```sh
-   catapp service install
-   ```
-5. **Open it:** <http://localhost:8787> on the Mac. For your phone, run `catapp url` and scan the QR code or open the link (same Wi-Fi). Opening the link once logs that browser in for a year. In Safari, Share > Add to Home Screen makes it feel like an app.
-6. **Optional: the assistant.** Install [Claude Code](https://claude.com/claude-code) on the same Mac and log in once (run `claude` in a terminal). Then the **Ask** button works. Without it, everything else still works, and Ask explains what's missing.
+It's also built for working with AI agents. Claude (or any other agent) can read it and
+post notes over MCP, so when an agent finishes some work in one of my repos it leaves a
+note on that project saying what changed and what's next. There's also a built-in
+assistant: press Ask and say "add a to-do to book the dentist" or "what's next on my
+projects?". If you want, you can even talk to it and have it talk back, with a
+character and an animated Live2D avatar.
 
-Your data lives in `~/Library/Application Support/catapp/`: `catapp.db`, the access `token`, `config.json` and a log. Each person's copy is completely separate.
+It runs on your own computer (macOS or Linux), keeps everything in one SQLite file, and
+works from your phone over your home Wi-Fi. My wife runs her own copy under a different
+name, so you can call yours whatever you like.
 
-**Updating** after pulling new code: `cargo install --path . && catapp service restart`.
+## Getting it running
 
-## Using it from a phone or another computer
-
-- `catapp url` prints the links: the Mac's `name.local` address (works from phones), a short name (works from most PCs), and the IP.
-- **Each address keeps its own login.** `mymac.local`, `mymac` and the IP count as different sites, so log in once at the address you bookmark.
-- The Mac has to be awake. If macOS asks whether `catapp` may accept incoming connections, allow it.
-- It's plain HTTP on your home network, protected by the token. Away from home, use a private network like Tailscale. Don't expose it to the internet.
-- To rename the Mac (and so its `.local` address): `sudo scutil --set LocalHostName newname` (also `ComputerName` and `HostName`).
-
-## To-do list
-
-The project with slug `todo` is the general to-do list. It shows at the top of the home page (first eight items; tap one to expand, tick to finish) instead of as a project card.
+You'll need [Rust](https://rustup.rs). Then, from this folder:
 
 ```sh
-catapp todo                  # show open items (creates the list the first time)
-catapp todo pay the gas bill # add one
-catapp task done 76          # tick one off
+cargo install --path .
+catapp config name MyApp        # optional: call it whatever you like
+catapp config owner Sam         # your first name, for the assistant
+catapp service install          # keep it running in the background
 ```
 
-## Assistant
+Open <http://localhost:8787>. For your phone, run `catapp url` and scan the QR code.
 
-The **Ask** button (top bar on desktop, floating button on phones; or open `/#/ask`) is a chat with Claude that can only touch this app: "add a to-do to book the dentist", "add a project for learning Blender", "what's next on my projects?". Follow-up messages continue the same conversation; **New chat** starts afresh.
+From a terminal it's things like `catapp todo "pay the gas bill"`,
+`catapp note blender "finished the donut"` and `catapp ls`.
 
-- **How it works:** each message runs Claude Code once in the background (`claude -p`, roughly 7 seconds) with no built-in tools (no shell, files or web), only this app's MCP server, and everything else auto-denied. It runs one request at a time, behind the app's login.
-- **It uses your Claude Code login and plan usage.** It's for you on your own Mac, not for serving other people.
-- **It can't delete anything**, and it's told not to abandon or archive projects unless asked. Its notes are labelled `assistant`.
-- **If Claude Code isn't installed or isn't logged in,** Ask replies with what to do instead.
-- **Settings** (environment variables for the service): `CATAPP_CLAUDE` (path to `claude`, if it's not in `~/.local/bin`), `CATAPP_ASSISTANT_MODEL` (e.g. `sonnet`, `haiku`).
+## Optional extras
 
-## Voice mode (optional, off by default)
+- **The assistant:** install [Claude Code](https://claude.com/claude-code) and log in
+  once, and the Ask button works. It can only touch the app (no shell, files or web),
+  and it uses your own Claude login.
+- **Agents posting updates:** `claude mcp add --scope user catapp -- catapp mcp`, then
+  tell your agents to post a note at the end of each session.
+- **Voice mode** (Apple Silicon Macs): `sh voice/setup.sh`, then `catapp config voice on`.
+  Speech runs locally ([Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) and
+  [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)), and replies start in
+  about a second and a half. `catapp config persona`, `memory` and `avatar` add a
+  character, something for them to remember, and a Live2D avatar that lip-syncs.
 
-Talk to the assistant and hear it answer, with an optional character and animated avatar. Everything speech-related runs locally on the Mac; only the conversation itself goes to Claude, as with typed messages.
+Everything else (settings, the port, using it away from home, all the commands) is in
+the [guide](docs/guide.md).
 
-```sh
-sh voice/setup.sh              # once: Python environment, Kokoro voice, Parakeet speech-to-text (~3 GB)
-catapp config voice on
-```
+## License
 
-- **Talking:** tap the mic in the Ask panel and speak. It sends when you pause for a second, or tap again to send straight away. Typed messages work too.
-- **Hearing:** replies are read aloud sentence by sentence as they're written. The speaker button in the panel's header turns that off.
-- **Faster replies:** while the panel is open, Claude stays running in the background, so replies start in about 1.5 seconds instead of 6. It stops after 3 idle minutes, or 20 minutes without a message.
-- **Voice:** `catapp config speaker af_heart` picks a [Kokoro voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md). `af_alloy,af_nicole` blends voices evenly, and named blends live in `voice/voice_server.py` (e.g. `patchouli`).
-- **A character:** `catapp config persona ~/path/to/character.md` makes the assistant play the character described in that file (the file name is shown as its name). `catapp config memory ~/path/to/notes.md` lets it read a notes file too (it can't change it). It's still limited to this app's tools. `none` turns either off.
-- **Avatar:** `sh voice/setup.sh --avatar` downloads Live2D's runtime and their free Hiyori sample model into the data folder's `avatar/`, then `catapp config avatar on`. Its mouth follows the voice. To use another Live2D (Cubism 3 or later) model, put its folder in `avatar/` in place of `Hiyori/`.
-- **Microphone on a phone:** browsers only allow the microphone on HTTPS pages (or on the Mac itself, at `localhost`). Over plain HTTP the phone can still hear replies and use keyboard dictation.
-
-## Agent status updates
-
-AI agents working in your repos can post short status notes to the matching project.
-
-- **Register the MCP server** for all your Claude Code sessions: `claude mcp add --scope user catapp -- ~/.cargo/bin/catapp mcp`. If you've renamed the app, register it under its slug instead (e.g. `maisyapp`) so the tools show up as `mcp__maisyapp__*`; `catapp config name` prints the exact commands.
-- **Connect repos to projects:** put each repo's folder in its project's links (one per line). An agent passes its working directory as the project, or from a shell: `catapp note . --source claude "what changed, what's next"`. The project whose links contain that folder (or its nearest parent) wins.
-- **Ask agents to post:** e.g. a line in `~/.claude/CLAUDE.md`: "At the end of a session in a repo linked to a CatApp project, post one short status note with `add_note` (project = your working directory, source = your name)."
-- Notes from the web app and CLI count as yours. Anything else is an agent. Each project's log has **All / Mine / Agents** filters.
-
-## CLI cheatsheet
-
-| Command | Does |
-|---|---|
-| `catapp ls` / `catapp ls -a` / `catapp ls -c work` | List projects; `-a` includes finished ones (done, abandoned, archived) |
-| `catapp show blender` | One project: details, tasks, log |
-| `catapp note blender "text"` | Add a note; no text means read stdin. `.` = this folder's project; `--source name` for agents |
-| `catapp set blender -s paused -n "next thing"` | Change status / next step / `--summary` / `--name` / `-c` / `--links` |
-| `catapp new "Name" -c work -n "first step"` | New project |
-| `catapp task add blender "thing"` / `task done 12` / `task undo 12` / `task rm 12` | Checklist |
-| `catapp todo` / `catapp todo "thing"` | The to-do list |
-| `catapp recent` / `catapp search word` | Latest notes / search everything |
-| `catapp export > snapshot.md` | Everything as Markdown |
-| `catapp config` | Name, owner, icon |
-| `catapp url` / `catapp info` | Links for other devices / where the data is |
-| `catapp service install` / `restart` / `uninstall` | The background service |
-
-Projects can be named by slug, id, any unique part of the name, or a folder path.
-
-**Statuses:** active, planned, idea, paused, done, abandoned (no further work planned), archived. Done, abandoned and archived count as finished: hidden unless you ask for them (`-a`, or "Show finished" in the app). Status and next-step changes are logged automatically.
-
-## Code
-
-| File | What |
-|---|---|
-| `src/db.rs` | Schema, queries, folder lookup, Markdown export, unit tests |
-| `src/web.rs` | axum server, JSON API, token/cookie auth, the assistant endpoints |
-| `src/voice.rs` | Voice mode: the kept-running Claude session (streamed replies) and the voice helper |
-| `voice/` | `voice_server.py` (Kokoro and Parakeet, embedded in the binary) and `setup.sh` |
-| `src/mcp.rs` | MCP over stdio (hand-written JSON-RPC, 9 tools) |
-| `src/brand.rs` | Name, owner, icon and voice settings from `config.json` |
-| `src/main.rs` | CLI (clap), `url` with QR code, launchd service |
-| `static/` | Single-page front end (vanilla JS), embedded in the binary |
-
-`cargo test` runs the unit tests. Set `CATAPP_HOME` to use a different data folder, e.g. for a test copy.
+[MIT](LICENSE)

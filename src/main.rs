@@ -11,11 +11,10 @@ mod web;
 use clap::{Parser, Subcommand};
 use db::{Db, NewProject, Note, Project, ProjectPatch, TaskPatch, STATUSES};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-const DEFAULT_PORT: u16 = 8787;
 /// The project that holds the general to-do list.
 const TODO_SLUG: &str = "todo";
 
@@ -30,16 +29,18 @@ struct Cli {
 enum Cmd {
     /// Run the web app (open it on your phone with the address from `catapp url`)
     Serve {
-        #[arg(long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        /// Default: the `port` setting (`catapp config port`), normally 8787
+        #[arg(long)]
+        port: Option<u16>,
         /// 0.0.0.0 lets other devices on your network connect; 127.0.0.1 keeps it to this computer
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
     },
     /// Print the address (with access token and QR code) to open on your phone
     Url {
-        #[arg(long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        /// Default: the `port` setting
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// List projects
     #[command(alias = "ls")]
@@ -141,7 +142,7 @@ enum Cmd {
     Mcp,
     /// Show where the data and token live
     Info,
-    /// Show or change the app's name, owner and icon, e.g. `catapp config name MaisyApp`
+    /// Show or change settings: name, owner, icon, port, voice..., e.g. `catapp config name MaisyApp`
     Config { key: Option<String>, value: Vec<String> },
     /// Keep the web app running in the background (launchd on macOS, systemd on Linux)
     Service {
@@ -166,8 +167,9 @@ enum TaskCmd {
 enum ServiceCmd {
     /// Start the app at login and keep it running
     Install {
-        #[arg(long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        /// Also saves it as the `port` setting. Default: the current setting
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Restart it, e.g. after `cargo install` has replaced the binary
     Restart,
@@ -278,6 +280,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let e = |e: db::Error| e.to_string();
     match cli.cmd {
         Cmd::Serve { port, bind } => {
+            let port = port.unwrap_or(brand::Brand::load(&home()).port);
             let state = Arc::new(web::AppState {
                 db: Mutex::new(open_db()?),
                 token: token()?,
@@ -290,6 +293,7 @@ fn run(cli: Cli) -> Result<(), String> {
             rt.block_on(web::serve(state, &bind, port)).map_err(|e| format!("can't serve on {bind}:{port}: {e}"))?;
         }
         Cmd::Url { port } => {
+            let port = port.unwrap_or(brand::Brand::load(&home()).port);
             let t = token()?;
             println!("On this computer: http://localhost:{port}");
             let mut phone = None;
@@ -509,6 +513,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("name:  {}", b.name);
                     println!("owner: {}", b.owner);
                     println!("icon:  {}", if b.icon.is_empty() { format!("auto ({})", b.icon_kind()) } else { b.icon.clone() });
+                    println!("port:  {}", b.port);
                     let on = |x: bool| if x { "on" } else { "off" };
                     let file = |f: &str| if f.is_empty() { "none".to_string() } else { f.to_string() };
                     println!("voice: {}  (speaker {}, avatar {})", on(b.voice), b.speaker, on(b.avatar));
@@ -525,7 +530,14 @@ fn run(cli: Cli) -> Result<(), String> {
                     let old_slug = b.slug();
                     b.set(&k, &value.join(" "))?;
                     b.save(&home())?;
-                    println!("{k} set. Reload the web page to see it.");
+                    if k == "port" {
+                        println!("port set to {}.", b.port);
+                        if !b.service_label.is_empty() {
+                            println!("Run `catapp service restart` to move the background service to it.");
+                        }
+                    } else {
+                        println!("{k} set. Reload the web page to see it.");
+                    }
                     if k == "name" && !b.service_label.is_empty() && b.service_label != b.new_service_label() {
                         println!("Run `catapp service install` to move the background service to the new name.");
                     }
@@ -575,6 +587,12 @@ fn launchd_service(cmd: ServiceCmd) -> Result<(), String> {
     let installed = b.installed_service_label();
     match cmd {
         ServiceCmd::Install { port } => {
+            // The service reads the port setting when it starts, so `catapp config port` plus a
+            // restart moves it.
+            if let Some(p) = port {
+                b.port = p;
+            }
+            let port = b.port;
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             let log = home().join("catapp.log");
             std::fs::create_dir_all(home()).map_err(|e| e.to_string())?;
@@ -593,7 +611,7 @@ fn launchd_service(cmd: ServiceCmd) -> Result<(), String> {
 <dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
-  <array><string>{}</string><string>serve</string><string>--port</string><string>{port}</string></array>
+  <array><string>{}</string><string>serve</string></array>
   <key>EnvironmentVariables</key>
   <dict><key>CATAPP_HOME</key><string>{}</string></dict>
   <key>RunAtLoad</key><true/>
@@ -645,7 +663,7 @@ fn systemd_unit_path(label: &str) -> PathBuf {
 }
 
 /// A systemd user unit that runs the web app and restarts it if it stops.
-fn systemd_unit(app: &str, exe: &std::path::Path, home: &std::path::Path, port: u16) -> String {
+fn systemd_unit(app: &str, exe: &std::path::Path, home: &std::path::Path) -> String {
     // Quoted for systemd, with `%` escaped (it starts a specifier).
     let q = |p: &std::path::Path| format!("\"{}\"", p.display().to_string().replace('%', "%%").replace('"', "\\\""));
     let log = home.join("catapp.log");
@@ -655,7 +673,7 @@ Description={app}: personal organiser web app
 After=network-online.target
 
 [Service]
-ExecStart={} serve --port {port}
+ExecStart={} serve
 Environment={}
 Restart=always
 RestartSec=3
@@ -692,6 +710,12 @@ fn systemd_service(cmd: ServiceCmd) -> Result<(), String> {
     let unit = |label: &str| format!("{label}.service");
     match cmd {
         ServiceCmd::Install { port } => {
+            // The service reads the port setting when it starts, so `catapp config port` plus a
+            // restart moves it.
+            if let Some(p) = port {
+                b.port = p;
+            }
+            let port = b.port;
             let exe = std::env::current_exe().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(home()).map_err(|e| e.to_string())?;
             // Replace any earlier install, even one made under an older name.
@@ -702,7 +726,7 @@ fn systemd_service(cmd: ServiceCmd) -> Result<(), String> {
             let label = b.new_service_label();
             let path = systemd_unit_path(&label);
             std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-            std::fs::write(&path, systemd_unit(&app, &exe, &home(), port)).map_err(|e| e.to_string())?;
+            std::fs::write(&path, systemd_unit(&app, &exe, &home())).map_err(|e| e.to_string())?;
             systemctl(&["daemon-reload"])?;
             systemctl(&["enable", &unit(&label)])?;
             systemctl(&["restart", &unit(&label)])?;
@@ -761,13 +785,14 @@ mod tests {
 
     #[test]
     fn systemd_unit_quotes_paths() {
-        let u = systemd_unit("MaisyApp", Path::new("/home/maisy/.cargo/bin/catapp"), Path::new("/home/maisy/.local/share/catapp"), 8787);
+        use std::path::Path;
+        let u = systemd_unit("MaisyApp", Path::new("/home/maisy/.cargo/bin/catapp"), Path::new("/home/maisy/.local/share/catapp"));
         assert!(u.contains("Description=MaisyApp: personal organiser web app"));
-        assert!(u.contains("ExecStart=\"/home/maisy/.cargo/bin/catapp\" serve --port 8787\n"));
+        assert!(u.contains("ExecStart=\"/home/maisy/.cargo/bin/catapp\" serve\n"));
         assert!(u.contains("Environment=\"CATAPP_HOME=/home/maisy/.local/share/catapp\"\n"));
         assert!(u.contains("StandardOutput=append:/home/maisy/.local/share/catapp/catapp.log\n"));
         assert!(u.contains("Restart=always") && u.contains("WantedBy=default.target"));
-        let odd = systemd_unit("X", Path::new("/opt/100% \"cat\"/catapp"), Path::new("/d"), 1);
+        let odd = systemd_unit("X", Path::new("/opt/100% \"cat\"/catapp"), Path::new("/d"));
         assert!(odd.contains(r#"ExecStart="/opt/100%% \"cat\"/catapp" serve"#));
     }
 }

@@ -17,6 +17,8 @@ pub struct Brand {
     pub icon: String,
     /// The launchd label the background service was installed under, if any.
     pub service_label: String,
+    /// The web app's port: `catapp serve`, `catapp url` and the service use it.
+    pub port: u16,
     /// Voice mode for the assistant: talk to it and hear replies. Off unless turned on.
     pub voice: bool,
     /// The Kokoro voice for replies: a voice name ("af_heart"), an even blend
@@ -37,6 +39,7 @@ impl Default for Brand {
             owner: "Cat".into(),
             icon: String::new(),
             service_label: String::new(),
+            port: DEFAULT_PORT,
             voice: false,
             speaker: DEFAULT_SPEAKER.into(),
             persona: String::new(),
@@ -50,6 +53,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("name", "the app's name, e.g. MaisyApp"),
     ("owner", "your first name, e.g. Maisy (the assistant and agents use it)"),
     ("icon", "cat, plain, or auto (cat for CatApp, plain otherwise)"),
+    ("port", "the web app's port (default 8787)"),
     ("voice", "on or off: talk to the assistant and hear its replies (needs voice/setup.sh)"),
     ("speaker", "the reply voice: a Kokoro voice like af_heart, or a blend like patchouli"),
     ("persona", "a text file describing a character for the assistant to play in voice mode, or none"),
@@ -58,6 +62,7 @@ pub const KEYS: &[(&str, &str)] = &[
 ];
 
 pub const DEFAULT_SPEAKER: &str = "af_heart";
+pub const DEFAULT_PORT: u16 = 8787;
 
 fn on_off(key: &str, v: &str) -> Result<bool, String> {
     match v.to_lowercase().as_str() {
@@ -107,6 +112,8 @@ impl Brand {
                 "auto" | "" => self.icon.clear(),
                 _ => return Err("icon must be cat, plain or auto".into()),
             },
+            "port" if v == "default" => self.port = DEFAULT_PORT,
+            "port" => self.port = v.parse().ok().filter(|p| *p > 0).ok_or("port must be a number from 1 to 65535")?,
             "voice" => self.voice = on_off(key, v)?,
             "avatar" => self.avatar = on_off(key, v)?,
             "speaker" if v.is_empty() || v == "default" => self.speaker = DEFAULT_SPEAKER.into(),
@@ -191,6 +198,12 @@ mod tests {
         b.set("icon", "cat").unwrap();
         assert_eq!(b.icon_kind(), "cat");
         assert!(b.set("icon", "dog").is_err() && b.set("name", " ").is_err() && b.set("colour", "x").is_err());
+        assert_eq!(b.port, 8787);
+        b.set("port", "9000").unwrap();
+        assert_eq!(b.port, 9000);
+        assert!(b.set("port", "0").is_err() && b.set("port", "70000").is_err() && b.set("port", "x").is_err());
+        let old: Brand = serde_json::from_str(r#"{"name":"CatApp"}"#).unwrap();
+        assert_eq!(old.port, 8787, "configs from before the setting get the default");
     }
 
     #[test]
