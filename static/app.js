@@ -213,7 +213,7 @@ const TODO_SHOWN = 8;
 
 function todoPanel(todo) {
   if (!todo) return '';
-  const allOpen = todo.tasks.filter(t => !t.done);
+  const allOpen = (pref.newestTasksFirst ? [...todo.tasks].reverse() : todo.tasks).filter(t => !t.done);
   const done = todo.tasks.length - allOpen.length;
   const open = allOpen.slice(0, TODO_SHOWN);
   const more = allOpen.length - open.length;
@@ -273,6 +273,7 @@ async function renderProject(slug) {
   const linkLines = p.links.split('\n').map(l => l.trim()).filter(Boolean);
   const logFilter = pref.logFilter || 'all';
   const showDone = !!pref.showDoneTasks;
+  const newestFirst = !!pref.newestTasksFirst;
   const pick = { all: () => true, mine: n => !isAgent(n) && n.kind === 'note', agents: isAgent };
   const counts = { mine: p.notes.filter(pick.mine).length, agents: p.notes.filter(pick.agents).length };
   const notes = p.notes.filter(pick[logFilter] || pick.all);
@@ -311,9 +312,9 @@ async function renderProject(slug) {
       </section>
 
       <section class="panel a-tasks">
-        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span>${p.tasks_done ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${p.tasks_done})`}</button>` : ''}</h2>
+        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${p.tasks_total > 1 ? `<button class="ghost" data-taskorder aria-pressed="${newestFirst}" title="Change task order">${newestFirst ? 'Newest first' : 'Oldest first'}</button>` : ''}${p.tasks_done ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${p.tasks_done})`}</button>` : ''}</span></h2>
         ${!showDone && p.tasks_total && p.tasks_total === p.tasks_done ? `<p class="empty">All done.</p>` : ''}
-        <ul class="tasks">${p.tasks.filter(t => showDone || !t.done).map(t => `
+        <ul class="tasks">${(newestFirst ? [...p.tasks].reverse() : p.tasks).filter(t => showDone || !t.done).map(t => `
           <li class="${t.done ? 'done' : ''}">
             <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
             <span class="t">${rich(t.text)}</span>
@@ -414,6 +415,8 @@ async function renderProject(slug) {
   // Tasks
   const sd = app.querySelector('[data-showdone]');
   if (sd) sd.onclick = () => { pref.showDoneTasks = !showDone; savePref(); renderProject(p.slug); };
+  const to = app.querySelector('[data-taskorder]');
+  if (to) to.onclick = () => { pref.newestTasksFirst = !newestFirst; savePref(); renderProject(p.slug); };
   app.querySelectorAll('[data-task]').forEach(cb => cb.onchange = () => guard(async () => {
     await api('PATCH', `/api/tasks/${cb.dataset.task}`, { done: cb.checked });
     renderProject(p.slug);
