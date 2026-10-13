@@ -4,7 +4,9 @@
 
 use crate::brand::Brand;
 use crate::db::{self, Db, NewProject, ProjectPatch, TaskPatch};
-use axum::extract::{ConnectInfo, Path, Query, Request, State};
+use crate::voice::Voice;
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -24,6 +26,8 @@ pub struct AppState {
     pub home: PathBuf,
     /// One assistant request at a time.
     pub assistant: tokio::sync::Mutex<()>,
+    /// Voice mode's running Claude session and voice helper.
+    pub voice: Arc<Voice>,
 }
 
 type St = State<Arc<AppState>>;
@@ -67,6 +71,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/recent", get(recent))
         .route("/api/search", get(search))
         .route("/api/assistant", post(assistant))
+        .route("/api/voice/warm", post(voice_warm))
+        .route("/api/voice/reset", post(voice_reset))
+        .route("/api/voice/chat", post(voice_chat))
+        .route("/api/voice/tts", post(voice_tts))
+        .route("/api/voice/stt", post(voice_stt).layer(DefaultBodyLimit::max(20 << 20)))
+        .route("/avatar/{*path}", get(avatar_file))
         .route("/", get(index));
     Router::new()
         .merge(api)
@@ -181,7 +191,13 @@ fn html_escape(s: &str) -> String {
 async fn meta(State(st): St) -> R {
     let db = st.db.lock().unwrap();
     let b = Brand::load(&st.home);
-    ok(json!({ "statuses": db::STATUSES, "categories": db.categories()?, "app": b.name, "owner": b.owner }))
+    let voice = b.voice.then(|| {
+        json!({
+            "persona": b.persona_name(),
+            "avatar": if b.avatar { avatar_model(&st.home) } else { None },
+        })
+    });
+    ok(json!({ "statuses": db::STATUSES, "categories": db.categories()?, "app": b.name, "owner": b.owner, "voice": voice }))
 }
 
 async fn list_projects(State(st): St) -> R {
@@ -299,7 +315,7 @@ fn find_claude() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-fn assistant_prompt(b: &Brand) -> String {
+pub(crate) fn assistant_prompt(b: &Brand) -> String {
     let (app, owner, slug) = (&b.name, &b.owner, b.slug());
     format!(
         "You are the assistant built into {app}, {owner}'s personal organiser. {owner} types quick requests, often \
@@ -314,7 +330,7 @@ delete anything or mark things abandoned or archived unless {owner} explicitly a
 }
 
 /// Claude's reply to a failed request, made friendlier when the cause is a missing login.
-fn explain_failure(text: &str) -> String {
+pub(crate) fn explain_failure(text: &str) -> String {
     let t = text.to_lowercase();
     if ["log in", "login", "logged in", "not authenticated", "authentication", "api key", "oauth", "/login"].iter().any(|k| t.contains(k)) {
         "The assistant needs Claude Code to be logged in on the computer running this app. Open a terminal there, run \
@@ -325,43 +341,59 @@ fn explain_failure(text: &str) -> String {
     }
 }
 
+fn not_installed() -> db::Error {
+    db::Error::Invalid(
+        "The assistant needs Claude Code, which isn't installed on the computer running this app (or isn't where the \
+app looks: set CATAPP_CLAUDE to its path). Everything else works without it."
+            .into(),
+    )
+}
+
+/// Claude Code locked to this app: no built-in tools, only this app's MCP server, everything
+/// else auto-denied. Callers add the output format, session and message.
+pub(crate) fn claude_command(home: &std::path::Path, brand: &Brand, prompt: &str) -> Result<tokio::process::Command, db::Error> {
+    let claude = find_claude().filter(|p| p.is_file()).ok_or_else(not_installed)?;
+    let exe = std::env::current_exe().map_err(|e| db::Error::Invalid(e.to_string()))?;
+    let slug = brand.slug();
+    let mcp = json!({ "mcpServers": { &slug: {
+        "command": exe, "args": ["mcp"], "env": { "CATAPP_HOME": home }
+    }}})
+    .to_string();
+    let allowed = format!("mcp__{slug}");
+    let mut cmd = tokio::process::Command::new(claude);
+    cmd.args(["-p", "--tools", "", "--strict-mcp-config", "--mcp-config", &mcp])
+        .args(["--allowedTools", &allowed, "--permission-mode", "dontAsk"])
+        .args(["--append-system-prompt", prompt]);
+    if let Ok(model) = std::env::var("CATAPP_ASSISTANT_MODEL") {
+        cmd.args(["--model", &model]);
+    }
+    cmd.current_dir(home).kill_on_drop(true);
+    Ok(cmd)
+}
+
+/// A session id from the browser, checked before it goes on a command line.
+pub(crate) fn session_id(s: Option<&str>) -> Result<Option<String>, db::Error> {
+    match s.filter(|s| !s.is_empty()) {
+        Some(s) if s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') => Ok(Some(s.to_string())),
+        Some(_) => Err(db::Error::Invalid("bad session id".into())),
+        None => Ok(None),
+    }
+}
+
 async fn assistant(State(st): St, Json(b): Json<AskBody>) -> R {
     let message = b.message.trim();
     if message.is_empty() {
         return Err(db::Error::Invalid("say something to the assistant".into()).into());
     }
-    let not_installed = || {
-        db::Error::Invalid(
-            "The assistant needs Claude Code, which isn't installed on the computer running this app (or isn't where the \
-app looks: set CATAPP_CLAUDE to its path). Everything else works without it."
-                .into(),
-        )
-    };
-    let claude = find_claude().filter(|p| p.is_file()).ok_or_else(not_installed)?;
-    let exe = std::env::current_exe().map_err(|e| db::Error::Invalid(e.to_string()))?;
     let brand = Brand::load(&st.home);
-    let slug = brand.slug();
-    let mcp = json!({ "mcpServers": { &slug: {
-        "command": exe, "args": ["mcp"], "env": { "CATAPP_HOME": st.home }
-    }}})
-    .to_string();
-    let allowed = format!("mcp__{slug}");
-    let _one_at_a_time = st.assistant.lock().await;
-    let mut cmd = tokio::process::Command::new(claude);
-    cmd.args(["-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--mcp-config", &mcp])
-        .args(["--allowedTools", &allowed, "--permission-mode", "dontAsk"])
-        .args(["--append-system-prompt", &assistant_prompt(&brand)]);
-    if let Some(s) = b.session.as_deref().filter(|s| !s.is_empty()) {
-        if !s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-            return Err(db::Error::Invalid("bad session id".into()).into());
-        }
-        cmd.args(["--resume", s]);
-    }
-    if let Ok(model) = std::env::var("CATAPP_ASSISTANT_MODEL") {
-        cmd.args(["--model", &model]);
+    let mut cmd = claude_command(&st.home, &brand, &assistant_prompt(&brand))?;
+    cmd.args(["--output-format", "json"]);
+    if let Some(s) = session_id(b.session.as_deref())? {
+        cmd.args(["--resume", &s]);
     }
     cmd.arg("--").arg(message);
-    cmd.current_dir(&st.home).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    let _one_at_a_time = st.assistant.lock().await;
     let out = tokio::time::timeout(Duration::from_secs(180), cmd.output())
         .await
         .map_err(|_| db::Error::Invalid("the assistant took more than 3 minutes and was stopped".into()))?
@@ -385,7 +417,106 @@ app looks: set CATAPP_CLAUDE to its path). Everything else works without it."
     }))
 }
 
+// ---- voice mode ----------------------------------------------------------------------
+
+fn voice_on(st: &AppState) -> Result<Brand, ApiError> {
+    let b = Brand::load(&st.home);
+    if b.voice {
+        Ok(b)
+    } else {
+        Err(db::Error::Invalid("voice mode is off: turn it on with `catapp config voice on`".into()).into())
+    }
+}
+
+#[derive(Deserialize)]
+struct WarmBody {
+    session: Option<String>,
+}
+
+async fn voice_warm(State(st): St, Json(w): Json<WarmBody>) -> R {
+    let b = voice_on(&st)?;
+    st.voice.warm(&st.home, &b, session_id(w.session.as_deref())?).await?;
+    ok(json!({ "ok": true }))
+}
+
+async fn voice_reset(State(st): St) -> R {
+    st.voice.reset().await;
+    ok(json!({ "ok": true }))
+}
+
+/// The reply as it's written: one JSON event per line (see `Voice::chat`).
+async fn voice_chat(State(st): St, Json(a): Json<AskBody>) -> Result<Response, ApiError> {
+    let b = voice_on(&st)?;
+    let message = a.message.trim().to_string();
+    if message.is_empty() {
+        return Err(db::Error::Invalid("say something to the assistant".into()).into());
+    }
+    let rx = st.voice.chat(&st.home, &b, session_id(a.session.as_deref())?, message).await?;
+    use tokio_stream::StreamExt;
+    let lines = tokio_stream::wrappers::ReceiverStream::new(rx).map(|v| Ok::<_, std::convert::Infallible>(format!("{v}\n")));
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson"), (header::CACHE_CONTROL, "no-cache")], axum::body::Body::from_stream(lines)).into_response())
+}
+
+#[derive(Deserialize)]
+struct TtsBody {
+    text: String,
+}
+
+/// One sentence in the configured voice, as base64 WAV.
+async fn voice_tts(State(st): St, Json(t): Json<TtsBody>) -> R {
+    let b = voice_on(&st)?;
+    ok(st.voice.speech(&st.home, json!({ "op": "tts", "text": t.text, "voice": b.speaker })).await?)
+}
+
+/// A recorded clip (any format ffmpeg reads) to text.
+async fn voice_stt(State(st): St, body: Bytes) -> R {
+    voice_on(&st)?;
+    let dir = st.home.join("voice").join("tmp");
+    std::fs::create_dir_all(&dir).map_err(|e| db::Error::Invalid(e.to_string()))?;
+    let clip = dir.join(format!("clip-{}.audio", rand::random::<u64>()));
+    std::fs::write(&clip, &body).map_err(|e| db::Error::Invalid(e.to_string()))?;
+    let r = st.voice.speech(&st.home, json!({ "op": "stt", "path": clip })).await;
+    let _ = std::fs::remove_file(&clip);
+    ok(r?)
+}
+
+/// The Live2D model in the data folder's `avatar/` (the first `*.model3.json`), as a URL path.
+fn avatar_model(home: &std::path::Path) -> Option<String> {
+    fn find(dir: &std::path::Path, depth: usize) -> Option<PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        if let Some(f) = entries.iter().find(|p| p.is_file() && p.to_string_lossy().ends_with(".model3.json")) {
+            return Some(f.clone());
+        }
+        entries.iter().filter(|p| p.is_dir() && depth > 0).find_map(|d| find(d, depth - 1))
+    }
+    let root = home.join("avatar");
+    let model = find(&root, 3)?;
+    let rel = model.strip_prefix(&root).ok()?;
+    Some(format!("/avatar/{}", rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")))
+}
+
+/// Files under the data folder's `avatar/`: the Live2D model and the Cubism runtime.
+async fn avatar_file(State(st): St, Path(path): Path<String>) -> Result<Response, ApiError> {
+    let not_found = || ApiError(db::Error::NotFound("avatar file".into()));
+    if path.split('/').any(|c| c.is_empty() || c == "." || c == ".." || c.contains('\\')) {
+        return Err(not_found());
+    }
+    let bytes = std::fs::read(st.home.join("avatar").join(&path)).map_err(|_| not_found())?;
+    let ctype = match path.rsplit('.').next().unwrap_or("") {
+        "json" => "application/json",
+        "js" => "text/javascript; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    Ok(([(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, "max-age=3600")], bytes).into_response())
+}
+
 pub async fn serve(state: Arc<AppState>, bind: &str, port: u16) -> std::io::Result<()> {
+    state.voice.clone().reap_idle();
     let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await
 }
