@@ -150,8 +150,12 @@ impl Brand {
         }
     }
 
-    /// The launchd label for a new service install. CatApp keeps its original label.
+    /// The service name for a new install: a launchd label on macOS (CatApp keeps its
+    /// original one), and the slug elsewhere (`maisyapp.service` for systemd).
     pub fn new_service_label(&self) -> String {
+        if !cfg!(target_os = "macos") {
+            return self.slug();
+        }
         match self.slug().as_str() {
             "catapp" => "bio.cat.catapp".into(),
             s => format!("local.organiser.{s}"),
@@ -176,11 +180,14 @@ mod tests {
     fn defaults_and_settings() {
         let mut b = Brand::default();
         assert_eq!((b.slug().as_str(), b.icon_kind()), ("catapp", "cat"));
-        assert_eq!(b.new_service_label(), "bio.cat.catapp");
+        if cfg!(target_os = "macos") {
+            assert_eq!(b.new_service_label(), "bio.cat.catapp");
+        }
         b.set("name", "Maisy App").unwrap();
         b.set("owner", "Maisy").unwrap();
         assert_eq!((b.slug().as_str(), b.icon_kind()), ("maisyapp", "plain"));
-        assert_eq!(b.new_service_label(), "local.organiser.maisyapp");
+        let label = if cfg!(target_os = "macos") { "local.organiser.maisyapp" } else { "maisyapp" };
+        assert_eq!(b.new_service_label(), label);
         b.set("icon", "cat").unwrap();
         assert_eq!(b.icon_kind(), "cat");
         assert!(b.set("icon", "dog").is_err() && b.set("name", " ").is_err() && b.set("colour", "x").is_err());
