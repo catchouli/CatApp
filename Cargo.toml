@@ -2,6 +2,7 @@
 name = "catapp"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "CatApp: Cat's personal organiser. Web app (phone-friendly), CLI and MCP server over one SQLite file"
 
 [[bin]]
