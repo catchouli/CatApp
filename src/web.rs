@@ -300,11 +300,11 @@ fn find_claude() -> Option<PathBuf> {
 }
 
 fn assistant_prompt(b: &Brand) -> String {
-    let (app, owner) = (&b.name, &b.owner);
+    let (app, owner, slug) = (&b.name, &b.owner, b.slug());
     format!(
         "You are the assistant built into {app}, {owner}'s personal organiser. {owner} types quick requests, often \
 on their phone: \"add a project for X\", \"add a to-do to Y\", \"note on <project> that Z\", \"what's next on \
-<project>?\". Use the catapp tools to do it, then reply in one or two short plain sentences saying exactly what you \
+<project>?\". Use the {slug} tools to do it, then reply in one or two short plain sentences saying exactly what you \
 did (name the project). The to-do list is the project with slug 'todo': add to-dos there with add_task. New projects \
 default to category 'personal' and status 'active' unless {owner} says otherwise. Pass source 'assistant' when adding \
 notes or updating projects. Act rather than ask: only ask a question when the request is genuinely ambiguous. Never \
@@ -339,15 +339,18 @@ app looks: set CATAPP_CLAUDE to its path). Everything else works without it."
     };
     let claude = find_claude().filter(|p| p.is_file()).ok_or_else(not_installed)?;
     let exe = std::env::current_exe().map_err(|e| db::Error::Invalid(e.to_string()))?;
-    let mcp = json!({ "mcpServers": { "catapp": {
+    let brand = Brand::load(&st.home);
+    let slug = brand.slug();
+    let mcp = json!({ "mcpServers": { &slug: {
         "command": exe, "args": ["mcp"], "env": { "CATAPP_HOME": st.home }
     }}})
     .to_string();
+    let allowed = format!("mcp__{slug}");
     let _one_at_a_time = st.assistant.lock().await;
     let mut cmd = tokio::process::Command::new(claude);
     cmd.args(["-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--mcp-config", &mcp])
-        .args(["--allowedTools", "mcp__catapp", "--permission-mode", "dontAsk"])
-        .args(["--append-system-prompt", &assistant_prompt(&Brand::load(&st.home))]);
+        .args(["--allowedTools", &allowed, "--permission-mode", "dontAsk"])
+        .args(["--append-system-prompt", &assistant_prompt(&brand)]);
     if let Some(s) = b.session.as_deref().filter(|s| !s.is_empty()) {
         if !s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             return Err(db::Error::Invalid("bad session id".into()).into());
