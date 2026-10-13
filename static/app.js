@@ -517,8 +517,8 @@ function saveAsk() {
 }
 
 function drawAsk(pending) {
-  const rows = ask.history.map(m => `<div class="msg ${m.who}">${rich(m.text).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')}</div>`);
-  if (pending) rows.push(`<div class="msg bot pending">Working on it… <span id="ask-secs"></span></div>`);
+  const rows = ask.history.filter(m => m.text).map(m => `<div class="msg ${m.who}">${rich(m.text).replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')}</div>`);
+  if (pending) rows.push(`<div class="msg bot pending">${pending === true ? 'Working on it…' : esc(pending)} <span id="ask-secs"></span></div>`);
   ask.log.innerHTML = rows.join('') || `<p class="hint">Ask in plain English: "add a project for learning Blender", "add a to-do to book the dentist", "what's next on my projects?", "note on Blender that I finished the donut".</p>`;
   ask.log.scrollTop = ask.log.scrollHeight;
 }
@@ -528,6 +528,7 @@ function openAsk() {
   document.body.classList.add('asking');
   drawAsk();
   ask.input.focus();
+  if (meta.voice) voiceOpen();
 }
 function closeAsk() {
   ask.panel.hidden = true;
@@ -537,6 +538,7 @@ function closeAsk() {
 async function sendAsk() {
   const text = ask.input.value.trim();
   if (!text || ask.send.disabled) return;
+  if (meta.voice) return voiceSend(text);
   ask.history.push({ who: 'me', text });
   ask.input.value = '';
   ask.send.disabled = true;
@@ -565,11 +567,296 @@ async function sendAsk() {
 document.getElementById('ask-open').onclick = openAsk;
 document.getElementById('ask-open-top').onclick = openAsk;
 document.getElementById('ask-close').onclick = closeAsk;
-document.getElementById('ask-new').onclick = () => { ask.session = null; ask.history = []; saveAsk(); drawAsk(); ask.input.focus(); };
+document.getElementById('ask-new').onclick = () => {
+  ask.session = null; ask.history = []; saveAsk(); drawAsk(); ask.input.focus();
+  if (meta.voice) { stopSpeaking(); api('POST', '/api/voice/reset').then(voiceWarm).catch(() => {}); }
+};
 document.getElementById('ask-form').onsubmit = e => { e.preventDefault(); sendAsk(); };
 ask.input.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAsk(); }
-  if (e.key === 'Escape') closeAsk();
+  if (e.key === 'Escape') { if (voice.queue.length || voice.source) stopSpeaking(); else closeAsk(); }
 });
+
+// ---- voice mode (`catapp config voice on`) --------------------------------------------
+// Replies stream in from a Claude session the server keeps running while this panel is
+// open; each finished sentence is spoken (Kokoro, on the server) while the next is written.
+// The mic records until you stop talking, and the server transcribes it (Parakeet).
+
+const voice = {
+  ready: false,
+  speak: pref.speak !== false,
+  ctx: null, out: null, level: null,  // audio context, output analyser, its sample buffer
+  queue: [], source: null, gen: 0,    // sentences waiting to play, the one playing
+  buf: '',                            // reply text not yet spoken
+  rec: null, cancelled: false,
+  lastUse: Date.now(),
+  mouth: 0,
+};
+const mic = document.getElementById('ask-mic');
+const speakBtn = document.getElementById('ask-speak');
+
+function voiceOpen() {
+  if (!voice.ready) {
+    voice.ready = true;
+    mic.hidden = false;
+    speakBtn.hidden = false;
+    speakBtn.setAttribute('aria-pressed', voice.speak);
+    if (meta.voice.persona) {
+      document.getElementById('ask-title').textContent = meta.voice.persona;
+      document.querySelector('.ask-sub').textContent = `Claude as ${meta.voice.persona}, limited to ${meta.app}`;
+    }
+    if (meta.voice.avatar) loadAvatar(meta.voice.avatar).catch(e => console.warn('avatar', e));
+    // Keep the session warm while the panel is open and in view, for up to 20 quiet minutes.
+    setInterval(() => {
+      if (!ask.panel.hidden && !document.hidden && Date.now() - voice.lastUse < 20 * 60e3) voiceWarm();
+    }, 60e3);
+  }
+  voiceWarm();
+}
+
+function voiceWarm() {
+  return api('POST', '/api/voice/warm', { session: ask.session }).catch(e => toast(e.message, true));
+}
+
+// The audio context has to start from a click or key press.
+function audio() {
+  if (!voice.ctx) {
+    voice.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    voice.out = voice.ctx.createAnalyser();
+    voice.out.fftSize = 512;
+    voice.level = new Float32Array(voice.out.fftSize);
+    voice.out.connect(voice.ctx.destination);
+  }
+  if (voice.ctx.state === 'suspended') voice.ctx.resume();
+  return voice.ctx;
+}
+
+function rms(analyser, buf) {
+  analyser.getFloatTimeDomainData(buf);
+  let sum = 0;
+  for (const x of buf) sum += x * x;
+  return Math.sqrt(sum / buf.length);
+}
+
+function stopSpeaking() {
+  voice.gen++;
+  voice.queue = [];
+  voice.buf = '';
+  if (voice.source instanceof AudioBufferSourceNode) { try { voice.source.stop(); } catch { /* already stopped */ } }
+  voice.source = null;
+}
+
+// Queue a sentence: its audio is fetched straight away, and played in order.
+function say(text) {
+  if (!voice.speak || !text.trim()) return;
+  const gen = voice.gen;
+  const clip = api('POST', '/api/voice/tts', { text }).then(async r => {
+    if (!r.wav || gen !== voice.gen) return null;
+    const bytes = Uint8Array.from(atob(r.wav), c => c.charCodeAt(0));
+    return audio().decodeAudioData(bytes.buffer);
+  }).catch(e => { toast(e.message, true); return null; });
+  voice.queue.push({ clip, gen });
+  if (!voice.source) playNext();
+}
+
+async function playNext() {
+  const next = voice.queue.shift();
+  if (!next) return;
+  const claim = {}; // holds the slot while the clip loads, so sentences play one at a time
+  voice.source = claim;
+  const buffer = await next.clip;
+  if (voice.source !== claim) return; // stopped meanwhile
+  if (!buffer || next.gen !== voice.gen) { voice.source = null; return playNext(); }
+  const src = audio().createBufferSource();
+  src.buffer = buffer;
+  src.connect(voice.out);
+  src.onended = () => { if (voice.source === src) { voice.source = null; playNext(); } };
+  voice.source = src;
+  src.start();
+}
+
+// Speak whole sentences out of the reply so far; `final` speaks whatever's left.
+function speakSentences(final) {
+  const end = /[.!?…]+["')\]]*\s+|\n+/;
+  let m;
+  while ((m = voice.buf.match(end))) {
+    const cut = m.index + m[0].length;
+    say(voice.buf.slice(0, cut).trim());
+    voice.buf = voice.buf.slice(cut);
+  }
+  if (final) { say(voice.buf.trim()); voice.buf = ''; }
+}
+
+async function voiceSend(text) {
+  audio();
+  stopSpeaking();
+  voice.lastUse = Date.now();
+  ask.history.push({ who: 'me', text });
+  ask.input.value = '';
+  ask.send.disabled = true;
+  const bot = { who: 'bot', text: '' };
+  ask.history.push(bot);
+  drawAsk(true);
+  let redraw = 0;
+  const show = () => { cancelAnimationFrame(redraw); redraw = requestAnimationFrame(() => drawAsk(bot.text ? false : true)); };
+  try {
+    const r = await fetch('/api/voice/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, session: ask.session }),
+    });
+    if (r.status === 401) { location.reload(); return; }
+    if (!r.ok) throw new Error(((await r.json().catch(() => null)) || {}).error || r.statusText);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let partial = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      partial += dec.decode(value, { stream: true });
+      const lines = partial.split('\n');
+      partial = lines.pop();
+      for (const line of lines.filter(Boolean)) {
+        const e = JSON.parse(line);
+        if (e.t === 'text') { bot.text += e.d; voice.buf += e.d; speakSentences(false); show(); }
+        else if (e.t === 'tool') speakSentences(true); // say "one sec" while it works
+        else if (e.t === 'done') {
+          if (e.session) ask.session = e.session;
+          if (e.error) ask.history.push({ who: 'bot err', text: e.error });
+        }
+      }
+    }
+    speakSentences(true);
+  } catch (e) {
+    ask.history.push({ who: 'bot err', text: e.message || String(e) });
+  } finally {
+    cancelAnimationFrame(redraw);
+    if (!bot.text) ask.history.splice(ask.history.indexOf(bot), 1);
+    ask.send.disabled = false;
+    saveAsk();
+    drawAsk();
+    if (!voice.rec) ask.input.focus();
+    render(); // the assistant may have changed things
+  }
+}
+
+// ---- talking: record until a second of quiet after speech (or a tap), then send ----
+
+async function startTalking() {
+  audio();
+  stopSpeaking();
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    toast(window.isSecureContext ? "The microphone is blocked: allow it for this page in the browser's settings."
+      : 'The microphone only works over HTTPS (or on the computer running the app).', true);
+    return;
+  }
+  const rec = new MediaRecorder(stream);
+  const chunks = [];
+  voice.rec = rec;
+  voice.cancelled = false;
+  rec.ondataavailable = e => chunks.push(e.data);
+  const src = voice.ctx.createMediaStreamSource(stream);
+  const an = voice.ctx.createAnalyser();
+  an.fftSize = 1024;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  const start = performance.now();
+  let heard = false, quietSince = start, floor = 0, floorN = 0;
+  rec.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    src.disconnect();
+    voice.rec = null;
+    mic.setAttribute('aria-pressed', 'false');
+    mic.style.removeProperty('--level');
+    if (voice.cancelled) return;
+    if (!heard) { toast("Didn't catch that"); return; }
+    mic.classList.add('busy');
+    drawAsk('Listening…');
+    try {
+      const blob = new Blob(chunks, { type: rec.mimeType });
+      const r = await fetch('/api/voice/stt', { method: 'POST', body: blob });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || r.statusText);
+      if (data.text) voiceSend(data.text);
+      else { drawAsk(); toast("Didn't catch that"); }
+    } catch (e) {
+      drawAsk();
+      toast(e.message || String(e), true);
+    } finally {
+      mic.classList.remove('busy');
+    }
+  };
+  const tick = () => {
+    if (rec.state !== 'recording') return;
+    const level = rms(an, buf), now = performance.now();
+    if (now - start < 300) { floor += level; floorN++; } // learn the room's background level
+    const threshold = Math.max(0.012, floorN ? 3 * floor / floorN : 0);
+    if (now - start >= 300 && level > threshold) { heard = true; quietSince = now; }
+    mic.style.setProperty('--level', Math.min(1, level * 12).toFixed(2));
+    if ((heard && now - quietSince > 1000) || (!heard && now - start > 8000) || now - start > 60e3) rec.stop();
+    else requestAnimationFrame(tick);
+  };
+  rec.start();
+  mic.setAttribute('aria-pressed', 'true');
+  tick();
+}
+
+mic.onclick = () => {
+  if (mic.classList.contains('busy') || ask.send.disabled) return;
+  if (voice.rec) voice.rec.stop(); // tap again: send now
+  else startTalking();
+};
+speakBtn.onclick = () => {
+  voice.speak = !voice.speak;
+  pref.speak = voice.speak;
+  savePref();
+  speakBtn.setAttribute('aria-pressed', voice.speak);
+  if (!voice.speak) stopSpeaking();
+};
+
+// ---- avatar: a Live2D model whose mouth follows the voice ---------------------------
+
+function loadScript(src) {
+  return new Promise((ok, fail) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = ok;
+    s.onerror = () => fail(new Error(`couldn't load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+async function loadAvatar(url) {
+  await loadScript('/avatar/live2dcubismcore.min.js');
+  await loadScript('https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js');
+  await loadScript('https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js');
+  const el = document.getElementById('ask-avatar');
+  el.hidden = false;
+  document.body.classList.add('voice-avatar');
+  const pixi = new PIXI.Application({ backgroundAlpha: 0, resizeTo: el, antialias: true, autoDensity: true, resolution: devicePixelRatio || 1 });
+  el.appendChild(pixi.view);
+  const model = await PIXI.live2d.Live2DModel.from(url);
+  pixi.stage.addChild(model);
+  voice.avatar = model;
+  // Head and shoulders: scale so the top ~36% of the model fills the box (the sides may crop).
+  const fit = () => {
+    const w = el.clientWidth, h = el.clientHeight;
+    const s = h / (model.internalModel.height * 0.36);
+    model.scale.set(s);
+    model.anchor.set(0.5, 0);
+    model.position.set(w / 2, 0);
+  };
+  fit();
+  new ResizeObserver(fit).observe(el);
+  pixi.ticker.add(() => {
+    const target = voice.source instanceof AudioBufferSourceNode ? Math.min(1, Math.max(0, (rms(voice.out, voice.level) - 0.01) * 9)) : 0;
+    voice.mouth += (target - voice.mouth) * (target > voice.mouth ? 0.6 : 0.3);
+  });
+  model.internalModel.on('beforeModelUpdate', () => {
+    model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', voice.mouth);
+  });
+}
 
 render();
