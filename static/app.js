@@ -533,6 +533,7 @@ function openAsk() {
 function closeAsk() {
   ask.panel.hidden = true;
   document.body.classList.remove('asking');
+  if (meta.voice) { closeMic(); stopSpeaking(); }
 }
 
 async function sendAsk() {
@@ -588,7 +589,7 @@ const voice = {
   ctx: null, out: null, level: null,  // audio context, output analyser, its sample buffer
   queue: [], source: null, gen: 0,    // sentences waiting to play, the one playing
   buf: '',                            // reply text not yet spoken
-  rec: null, cancelled: false,
+  rec: null, cancelled: false, stream: null,
   lastUse: Date.now(),
   mouth: 0,
 };
@@ -741,12 +742,25 @@ async function voiceSend(text) {
 
 // ---- talking: record until a second of quiet after speech (or a tap), then send ----
 
+// The mic stays open while the panel is, so recording starts the moment you tap (opening it
+// takes a moment, which used to clip the first word: "add a" came out as "I had a").
+async function micStream() {
+  if (!voice.stream || !voice.stream.active) {
+    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  }
+  return voice.stream;
+}
+function closeMic() {
+  if (voice.rec) { voice.cancelled = true; voice.rec.stop(); }
+  if (voice.stream) { voice.stream.getTracks().forEach(t => t.stop()); voice.stream = null; }
+}
+
 async function startTalking() {
   audio();
   stopSpeaking();
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    stream = await micStream();
   } catch (e) {
     toast(window.isSecureContext ? "The microphone is blocked: allow it for this page in the browser's settings."
       : 'The microphone only works over HTTPS (or on the computer running the app).', true);
@@ -765,7 +779,6 @@ async function startTalking() {
   const start = performance.now();
   let heard = false, quietSince = start, floor = 0, floorN = 0;
   rec.onstop = async () => {
-    stream.getTracks().forEach(t => t.stop());
     src.disconnect();
     voice.rec = null;
     mic.setAttribute('aria-pressed', 'false');
@@ -802,6 +815,8 @@ async function startTalking() {
   mic.setAttribute('aria-pressed', 'true');
   tick();
 }
+
+document.addEventListener('visibilitychange', () => { if (document.hidden && meta.voice) closeMic(); });
 
 mic.onclick = () => {
   if (mic.classList.contains('busy') || ask.send.disabled) return;
