@@ -511,11 +511,19 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 Some(k) if value.is_empty() => return Err(format!("give a value: catapp config {k} <value>")),
                 Some(k) => {
+                    let old_slug = b.slug();
                     b.set(&k, &value.join(" "))?;
                     b.save(&home())?;
                     println!("{k} set. Reload the web page to see it.");
                     if k == "name" && !b.service_label.is_empty() && b.service_label != b.new_service_label() {
                         println!("Run `catapp service install` to move the background service to the new name.");
+                    }
+                    let slug = b.slug();
+                    if slug != old_slug {
+                        println!(
+                            "If Claude Code knows it as '{old_slug}', re-register it so its tools use the new name:\n  \
+claude mcp remove --scope user {old_slug}\n  claude mcp add --scope user {slug} -- catapp mcp"
+                        );
                     }
                 }
             }
