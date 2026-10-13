@@ -1,0 +1,21 @@
+[package]
+name = "catapp"
+version = "0.1.0"
+edition = "2021"
+description = "CatApp: Cat's personal organiser. Web app (phone-friendly), CLI and MCP server over one SQLite file"
+
+[[bin]]
+name = "catapp"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "5"
+rand = "0.8"
+qrcode = { version = "0.14", default-features = false }
