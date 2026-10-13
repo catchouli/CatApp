@@ -11,7 +11,7 @@ mod web;
 use clap::{Parser, Subcommand};
 use db::{Db, NewProject, Note, Project, ProjectPatch, TaskPatch, STATUSES};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +32,7 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
-        /// 0.0.0.0 lets other devices on your network connect; 127.0.0.1 keeps it to this Mac
+        /// 0.0.0.0 lets other devices on your network connect; 127.0.0.1 keeps it to this computer
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
     },
@@ -143,7 +143,7 @@ enum Cmd {
     Info,
     /// Show or change the app's name, owner and icon, e.g. `catapp config name MaisyApp`
     Config { key: Option<String>, value: Vec<String> },
-    /// Keep the web app running in the background on this Mac (launchd)
+    /// Keep the web app running in the background (launchd on macOS, systemd on Linux)
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
@@ -207,18 +207,22 @@ fn token() -> Result<String, String> {
     Ok(t)
 }
 
-/// This Mac's address on the local network (no packets are sent).
+/// This computer's address on the local network (no packets are sent).
 fn lan_ip() -> Option<String> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.168.0.1:80").or_else(|_| s.connect("8.8.8.8:80")).ok()?;
     Some(s.local_addr().ok()?.ip().to_string())
 }
 
-/// The Bonjour name (`name.local`), which stays the same when the IP changes.
+/// The Bonjour/Avahi name (`name.local`), which stays the same when the IP changes.
 fn local_hostname() -> Option<String> {
-    let out = std::process::Command::new("scutil").args(["--get", "LocalHostName"]).output().ok()?;
-    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (!name.is_empty()).then(|| format!("{name}.local"))
+    let out = if cfg!(target_os = "macos") {
+        std::process::Command::new("scutil").args(["--get", "LocalHostName"]).output().ok()?
+    } else {
+        std::process::Command::new("hostname").output().ok()?
+    };
+    let name = String::from_utf8(out.stdout).ok()?.trim().split('.').next()?.to_string();
+    (!name.is_empty() && name != "localhost").then(|| format!("{name}.local"))
 }
 
 fn ago(ts: &str) -> String {
@@ -287,19 +291,19 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::Url { port } => {
             let t = token()?;
-            println!("On this Mac:   http://localhost:{port}");
+            println!("On this computer: http://localhost:{port}");
             let mut phone = None;
             if let Some(h) = local_hostname() {
                 let u = format!("http://{h}:{port}/?token={t}");
-                println!("On your phone: {u}");
+                println!("On your phone:    {u}");
                 if let Some(short) = h.strip_suffix(".local") {
-                    println!("  short name:  http://{short}:{port}/?token={t}   (PCs on your network; often not phones)");
+                    println!("  short name:     http://{short}:{port}/?token={t}   (PCs on your network; often not phones)");
                 }
                 phone = Some(u);
             }
             if let Some(ip) = lan_ip() {
                 let u = format!("http://{ip}:{port}/?token={t}");
-                println!("    or by IP:  {u}");
+                println!("    or by IP:     {u}");
                 phone = phone.or(Some(u));
             }
             if let Some(u) = phone {
@@ -309,11 +313,11 @@ fn run(cli: Cli) -> Result<(), String> {
                         .dark_color(qrcode::render::unicode::Dense1x2::Light)
                         .light_color(qrcode::render::unicode::Dense1x2::Dark)
                         .build();
-                    println!("\nScan with your phone (same Wi-Fi as this Mac):\n{img}");
+                    println!("\nScan with your phone (same Wi-Fi as this computer):\n{img}");
                 }
             }
             println!("Opening a link once logs that browser in for a year, at that address only: bookmark the same address.");
-            println!("The Mac must be awake. It runs as a service if you've done `catapp service install`.");
+            println!("This computer must be awake. It runs as a service if you've done `catapp service install`.");
         }
         Cmd::List { category, all, json } => {
             let db = open_db()?;
@@ -564,7 +568,7 @@ fn launchctl(args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn service(cmd: ServiceCmd) -> Result<(), String> {
+fn launchd_service(cmd: ServiceCmd) -> Result<(), String> {
     let mut b = brand::Brand::load(&home());
     let app = b.name.clone();
     let domain = format!("gui/{}", uid()?);
@@ -635,6 +639,112 @@ fn service(cmd: ServiceCmd) -> Result<(), String> {
     Ok(())
 }
 
+/// The systemd user unit's file.
+fn systemd_unit_path(label: &str) -> PathBuf {
+    dirs::config_dir().unwrap_or_default().join("systemd/user").join(format!("{label}.service"))
+}
+
+/// A systemd user unit that runs the web app and restarts it if it stops.
+fn systemd_unit(app: &str, exe: &std::path::Path, home: &std::path::Path, port: u16) -> String {
+    // Quoted for systemd, with `%` escaped (it starts a specifier).
+    let q = |p: &std::path::Path| format!("\"{}\"", p.display().to_string().replace('%', "%%").replace('"', "\\\""));
+    let log = home.join("catapp.log");
+    format!(
+        "[Unit]
+Description={app}: personal organiser web app
+After=network-online.target
+
+[Service]
+ExecStart={} serve --port {port}
+Environment={}
+Restart=always
+RestartSec=3
+StandardOutput=append:{}
+StandardError=append:{}
+
+[Install]
+WantedBy=default.target
+",
+        q(exe),
+        q(std::path::Path::new(&format!("CATAPP_HOME={}", home.display()))),
+        log.display().to_string().replace('%', "%%"),
+        log.display().to_string().replace('%', "%%"),
+    )
+}
+
+fn systemctl(args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|e| format!("couldn't run systemctl ({e}): this needs a Linux system running systemd"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl --user {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
+    }
+}
+
+fn systemd_service(cmd: ServiceCmd) -> Result<(), String> {
+    let mut b = brand::Brand::load(&home());
+    let app = b.name.clone();
+    let installed = b.installed_service_label();
+    let unit = |label: &str| format!("{label}.service");
+    match cmd {
+        ServiceCmd::Install { port } => {
+            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(home()).map_err(|e| e.to_string())?;
+            // Replace any earlier install, even one made under an older name.
+            if systemd_unit_path(&installed).exists() {
+                let _ = systemctl(&["disable", "--now", &unit(&installed)]);
+                let _ = std::fs::remove_file(systemd_unit_path(&installed));
+            }
+            let label = b.new_service_label();
+            let path = systemd_unit_path(&label);
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            std::fs::write(&path, systemd_unit(&app, &exe, &home(), port)).map_err(|e| e.to_string())?;
+            systemctl(&["daemon-reload"])?;
+            systemctl(&["enable", &unit(&label)])?;
+            systemctl(&["restart", &unit(&label)])?;
+            b.service_label = label.clone();
+            b.save(&home())?;
+            println!("{app} now runs in the background and starts when you log in (port {port}).");
+            println!("It runs {}: reinstall the service if you move or rebuild it elsewhere.", exe.display());
+            println!("Log: {}   Status: systemctl --user status {}", home().join("catapp.log").display(), unit(&label));
+            println!("To keep it running while you're logged out too: loginctl enable-linger $USER");
+        }
+        ServiceCmd::Restart => {
+            if !systemd_unit_path(&installed).exists() {
+                return Err("the service isn't installed: run `catapp service install` first".into());
+            }
+            systemctl(&["restart", &unit(&installed)])?;
+            println!("{app} restarted with the current binary.");
+        }
+        ServiceCmd::Uninstall => {
+            let path = systemd_unit_path(&installed);
+            if path.exists() {
+                let _ = systemctl(&["disable", "--now", &unit(&installed)]);
+                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                let _ = systemctl(&["daemon-reload"]);
+            }
+            b.service_label.clear();
+            b.save(&home())?;
+            println!("{app}'s background service is stopped and removed. Your data is untouched.");
+        }
+    }
+    Ok(())
+}
+
+fn service(cmd: ServiceCmd) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        launchd_service(cmd)
+    } else if cfg!(target_os = "linux") {
+        systemd_service(cmd)
+    } else {
+        Err("`catapp service` works on macOS and Linux. Elsewhere, run `catapp serve` (with your system's own way of starting it at login).".into())
+    }
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -642,5 +752,22 @@ fn main() -> ExitCode {
             eprintln!("catapp: {msg}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_unit_quotes_paths() {
+        let u = systemd_unit("MaisyApp", Path::new("/home/maisy/.cargo/bin/catapp"), Path::new("/home/maisy/.local/share/catapp"), 8787);
+        assert!(u.contains("Description=MaisyApp: personal organiser web app"));
+        assert!(u.contains("ExecStart=\"/home/maisy/.cargo/bin/catapp\" serve --port 8787\n"));
+        assert!(u.contains("Environment=\"CATAPP_HOME=/home/maisy/.local/share/catapp\"\n"));
+        assert!(u.contains("StandardOutput=append:/home/maisy/.local/share/catapp/catapp.log\n"));
+        assert!(u.contains("Restart=always") && u.contains("WantedBy=default.target"));
+        let odd = systemd_unit("X", Path::new("/opt/100% \"cat\"/catapp"), Path::new("/d"), 1);
+        assert!(odd.contains(r#"ExecStart="/opt/100%% \"cat\"/catapp" serve"#));
     }
 }
