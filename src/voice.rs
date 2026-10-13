@@ -80,7 +80,9 @@ fn invalid(msg: impl Into<String>) -> db::Error {
 }
 
 const SPOKEN: &str = "\n\nVoice mode: your replies are read aloud by a text-to-speech voice, and {owner} may be talking \
-to you through speech recognition, so expect the odd misheard word and go with the most likely meaning. Write natural \
+to you through speech recognition, which often garbles names and the first word or two (\"I had a to-do...\" is \
+usually \"add a to-do...\"). Go with the most likely meaning: if a message sounds like a request, do it rather than \
+asking or searching. Write natural \
 speech: no markdown, lists, links, emoji or emoticons, and keep it short. When a request needs the tools, start with a \
 few spoken words (like \"sure, one sec\") before the first tool call, so there's no silence while you work.";
 
@@ -92,9 +94,11 @@ fn voice_prompt(b: &Brand) -> String {
         p += &format!(
             "\n\n## Persona\n\nIn voice mode you are the character below: their personality, voice and attitude. You're \
 still {app}'s assistant, though: you can only use the {app} tools and the rules above still apply. Anything the \
-character description says about files, chats, sending messages or updating a memory file doesn't apply here.\n\n{}",
+character description says about files, chats, sending messages or updating a memory file doesn't apply here. The \
+attitude is flavour, never an obstacle: always do what {owner} asks straight away, then add the personality.\n\n{}",
             persona.trim(),
-            app = b.name
+            app = b.name,
+            owner = b.owner
         );
         if let Some(memory) = read(&b.memory) {
             p += &format!(
