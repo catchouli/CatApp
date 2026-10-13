@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>__APP__</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#f5f3ee" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#17181b" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="__APP__">
+</head>
+<body>
+<header class="top">
+  <a href="#/" class="brand"><img src="/icon.svg" alt="" width="28" height="28"><span>__APP__</span></a>
+  <nav>
+    <a href="#/search" class="iconbtn" aria-label="Search" title="Search">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </a>
+    <button id="ask-open-top" class="btn ask-top" title="Ask the assistant">Ask</button>
+    <a href="#/new" class="btn primary">New project</a>
+  </nav>
+</header>
+<main id="app" aria-live="polite"></main>
+<div id="toast" role="status"></div>
+<button id="ask-open" class="ask-fab" aria-label="Ask the assistant" title="Ask the assistant">
+  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H10l-4.5 4v-4h0A2.5 2.5 0 0 1 4 13.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+  <span>Ask</span>
+</button>
+<section id="ask" class="ask" hidden aria-label="Assistant">
+  <header>
+    <strong>Assistant</strong>
+    <span class="hint ask-sub">Claude, limited to __APP__</span>
+    <button class="ghost" id="ask-new" title="Start a new conversation">New chat</button>
+    <button class="ghost" id="ask-close" aria-label="Close">✕</button>
+  </header>
+  <div id="ask-log" class="ask-log" aria-live="polite"></div>
+  <form id="ask-form" class="ask-form">
+    <textarea id="ask-in" rows="2" placeholder="Add a to-do to call the dentist… What's next on my projects?" aria-label="Message"></textarea>
+    <button class="primary" id="ask-send">Send</button>
+  </form>
+</section>
+<script src="/app.js"></script>
+</body>
+</html>
