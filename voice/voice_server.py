@@ -22,10 +22,13 @@ from pathlib import Path
 import numpy as np
 
 # Named voices: a weighted blend of Kokoro style vectors plus a default speed. A voice can
-# also be a plain Kokoro voice ("af_heart") or an even blend ("af_alloy,af_nicole").
+# also be a plain Kokoro voice ("af_heart") or an even blend ("af_alloy,af_nicole"), and
+# ":<speed>" on the end sets the speed ("patchouli:1.2"; 0.5 to 2, artifacts creep in
+# above about 1.15).
 BLENDS = {
     # Patchouli's voice, chosen by Cat in a three-round bake-off (2026-09).
     "patchouli": {"blend": {"af_alloy": 0.5, "af_nicole": 0.5}, "speed": 1.1},
+    "patchouli-fast": {"blend": {"af_alloy": 0.5, "af_nicole": 0.5}, "speed": 1.15},
 }
 
 STT_MODEL = "mlx-community/parakeet-tdt-0.6b-v2"
@@ -58,13 +61,15 @@ class Voice:
     def style(self, voice: str):
         """(style, speed) for a voice name."""
         if voice not in self.styles:
-            recipe = BLENDS.get(voice)
+            name, _, speed = voice.partition(":")
+            recipe = BLENDS.get(name)
             if recipe is None:
-                names = [v.strip() for v in voice.split(",") if v.strip()] or ["af_heart"]
+                names = [v.strip() for v in name.split(",") if v.strip()] or ["af_heart"]
                 recipe = {"blend": {n: 1.0 for n in names}, "speed": 1.0}
             total = sum(recipe["blend"].values()) or 1.0
             style = sum(self.kokoro.get_voice_style(n) * (w / total) for n, w in recipe["blend"].items())
-            self.styles[voice] = (style, recipe["speed"])
+            speed = min(2.0, max(0.5, float(speed))) if speed else recipe["speed"]
+            self.styles[voice] = (style, speed)
         return self.styles[voice]
 
     def tts(self, text: str, voice: str) -> dict:
