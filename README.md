@@ -66,7 +66,7 @@ The **Ask** button (top bar on desktop, floating button on phones; or open `/#/a
 
 AI agents working in your repos can post short status notes to the matching project.
 
-- **Register the MCP server** for all your Claude Code sessions: `claude mcp add --scope user catapp -- ~/.cargo/bin/catapp mcp`
+- **Register the MCP server** for all your Claude Code sessions: `claude mcp add --scope user catapp -- ~/.cargo/bin/catapp mcp`. If you've renamed the app, register it under its slug instead (e.g. `maisyapp`) so the tools show up as `mcp__maisyapp__*`; `catapp config name` prints the exact commands.
 - **Connect repos to projects:** put each repo's folder in its project's links (one per line). An agent passes its working directory as the project, or from a shell: `catapp note . --source claude "what changed, what's next"`. The project whose links contain that folder (or its nearest parent) wins.
 - **Ask agents to post:** e.g. a line in `~/.claude/CLAUDE.md`: "At the end of a session in a repo linked to a CatApp project, post one short status note with `add_note` (project = your working directory, source = your name)."
 - Notes from the web app and CLI count as yours. Anything else is an agent. Each project's log has **All / Mine / Agents** filters.

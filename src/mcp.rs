@@ -1,6 +1,6 @@
 //! A minimal MCP server over stdio (JSON-RPC, one message per line), so
 //! Claude and other agents can read and update projects. Register it with:
-//! `claude mcp add catapp -- catapp mcp`
+//! `claude mcp add catapp -- catapp mcp` (use the app's slug, e.g. `maisyapp`, if renamed)
 
 use crate::brand::Brand;
 use crate::db::{Db, NewProject, ProjectPatch, TaskPatch};
@@ -228,7 +228,7 @@ fn handle(db: &Db, brand: &Brand, msg: &Value) -> Option<Value> {
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "catapp", "version": env!("CARGO_PKG_VERSION") },
+                "serverInfo": { "name": brand.slug(), "version": env!("CARGO_PKG_VERSION") },
                 "instructions": instructions(brand)
             })
         }
