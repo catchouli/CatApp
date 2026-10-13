@@ -62,6 +62,23 @@ The **Ask** button (top bar on desktop, floating button on phones; or open `/#/a
 - **If Claude Code isn't installed or isn't logged in,** Ask replies with what to do instead.
 - **Settings** (environment variables for the service): `CATAPP_CLAUDE` (path to `claude`, if it's not in `~/.local/bin`), `CATAPP_ASSISTANT_MODEL` (e.g. `sonnet`, `haiku`).
 
+## Voice mode (optional, off by default)
+
+Talk to the assistant and hear it answer, with an optional character and animated avatar. Everything speech-related runs locally on the Mac; only the conversation itself goes to Claude, as with typed messages.
+
+```sh
+sh voice/setup.sh              # once: Python environment, Kokoro voice, Parakeet speech-to-text (~3 GB)
+catapp config voice on
+```
+
+- **Talking:** tap the mic in the Ask panel and speak. It sends when you pause for a second, or tap again to send straight away. Typed messages work too.
+- **Hearing:** replies are read aloud sentence by sentence as they're written. The speaker button in the panel's header turns that off.
+- **Faster replies:** while the panel is open, Claude stays running in the background, so replies start in about 1.5 seconds instead of 6. It stops after 3 idle minutes, or 20 minutes without a message.
+- **Voice:** `catapp config speaker af_heart` picks a [Kokoro voice](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md). `af_alloy,af_nicole` blends voices evenly, and named blends live in `voice/voice_server.py` (e.g. `patchouli`).
+- **A character:** `catapp config persona ~/path/to/character.md` makes the assistant play the character described in that file (the file name is shown as its name). `catapp config memory ~/path/to/notes.md` lets it read a notes file too (it can't change it). It's still limited to this app's tools. `none` turns either off.
+- **Avatar:** `sh voice/setup.sh --avatar` downloads Live2D's runtime and their free Hiyori sample model into the data folder's `avatar/`, then `catapp config avatar on`. Its mouth follows the voice. To use another Live2D (Cubism 3 or later) model, put its folder in `avatar/` in place of `Hiyori/`.
+- **Microphone on a phone:** browsers only allow the microphone on HTTPS pages (or on the Mac itself, at `localhost`). Over plain HTTP the phone can still hear replies and use keyboard dictation.
+
 ## Agent status updates
 
 AI agents working in your repos can post short status notes to the matching project.
@@ -97,9 +114,11 @@ Projects can be named by slug, id, any unique part of the name, or a folder path
 | File | What |
 |---|---|
 | `src/db.rs` | Schema, queries, folder lookup, Markdown export, unit tests |
-| `src/web.rs` | axum server, JSON API, token/cookie auth, the assistant endpoint |
+| `src/web.rs` | axum server, JSON API, token/cookie auth, the assistant endpoints |
+| `src/voice.rs` | Voice mode: the kept-running Claude session (streamed replies) and the voice helper |
+| `voice/` | `voice_server.py` (Kokoro and Parakeet, embedded in the binary) and `setup.sh` |
 | `src/mcp.rs` | MCP over stdio (hand-written JSON-RPC, 9 tools) |
-| `src/brand.rs` | Name, owner and icon from `config.json` |
+| `src/brand.rs` | Name, owner, icon and voice settings from `config.json` |
 | `src/main.rs` | CLI (clap), `url` with QR code, launchd service |
 | `static/` | Single-page front end (vanilla JS), embedded in the binary |
 

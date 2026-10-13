@@ -5,6 +5,7 @@
 mod brand;
 mod db;
 mod mcp;
+mod voice;
 mod web;
 
 use clap::{Parser, Subcommand};
@@ -278,6 +279,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 token: token()?,
                 home: home(),
                 assistant: tokio::sync::Mutex::new(()),
+                voice: Default::default(),
             });
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             println!("{} on http://localhost:{port}  (run `catapp url` for the phone address)", brand::Brand::load(&home()).name);
@@ -503,9 +505,14 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("name:  {}", b.name);
                     println!("owner: {}", b.owner);
                     println!("icon:  {}", if b.icon.is_empty() { format!("auto ({})", b.icon_kind()) } else { b.icon.clone() });
+                    let on = |x: bool| if x { "on" } else { "off" };
+                    let file = |f: &str| if f.is_empty() { "none".to_string() } else { f.to_string() };
+                    println!("voice: {}  (speaker {}, avatar {})", on(b.voice), b.speaker, on(b.avatar));
+                    println!("persona: {}", file(&b.persona));
+                    println!("memory:  {}", file(&b.memory));
                     println!("\nChange with `catapp config <setting> <value>`:");
                     for (k, d) in brand::KEYS {
-                        println!("  {k:<6} {d}");
+                        println!("  {k:<8} {d}");
                     }
                     println!("Reload the web page to see changes.");
                 }
