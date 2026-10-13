@@ -55,7 +55,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("icon", "cat, plain, or auto (cat for CatApp, plain otherwise)"),
     ("port", "the web app's port (default 8787)"),
     ("voice", "on or off: talk to the assistant and hear its replies (needs voice/setup.sh)"),
-    ("speaker", "the reply voice: a Kokoro voice like af_heart, or a blend like patchouli"),
+    ("speaker", "the reply voice: a Kokoro voice like af_heart or a blend like patchouli, :1.2 for faster"),
     ("persona", "a text file describing a character for the assistant to play in voice mode, or none"),
     ("memory", "a notes file the persona can read (not change) in voice mode, or none"),
     ("avatar", "on or off: a Live2D avatar that lip-syncs in voice mode"),
@@ -70,6 +70,14 @@ fn on_off(key: &str, v: &str) -> Result<bool, String> {
         "off" | "no" | "false" => Ok(false),
         _ => Err(format!("{key} must be on or off")),
     }
+}
+
+/// A voice name or blend, optionally with ":<speed>" (0.5 to 2), e.g. "patchouli:1.2".
+fn valid_speaker(v: &str) -> bool {
+    let (name, speed) = v.split_once(':').unwrap_or((v, "1"));
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-,".contains(c))
+        && speed.parse::<f32>().is_ok_and(|s| (0.5..=2.0).contains(&s))
 }
 
 /// An existing file's absolute path, from a path that may start with `~/`; "" for none.
@@ -117,8 +125,8 @@ impl Brand {
             "voice" => self.voice = on_off(key, v)?,
             "avatar" => self.avatar = on_off(key, v)?,
             "speaker" if v.is_empty() || v == "default" => self.speaker = DEFAULT_SPEAKER.into(),
-            "speaker" if v.chars().all(|c| c.is_ascii_alphanumeric() || "_-,".contains(c)) => self.speaker = v.into(),
-            "speaker" => return Err("speaker must be a Kokoro voice name like af_heart, or a blend name".into()),
+            "speaker" if valid_speaker(v) => self.speaker = v.into(),
+            "speaker" => return Err("speaker must be a Kokoro voice like af_heart or a blend like patchouli, optionally with a speed from 0.5 to 2 (patchouli:1.2)".into()),
             "persona" => self.persona = file_setting(key, v)?,
             "memory" => self.memory = file_setting(key, v)?,
             _ => {
@@ -214,6 +222,8 @@ mod tests {
         b.set("speaker", "patchouli").unwrap();
         assert!(b.voice && b.speaker == "patchouli");
         assert!(b.set("voice", "maybe").is_err() && b.set("speaker", "a b").is_err());
+        b.set("speaker", "patchouli:1.2").unwrap();
+        assert!(b.set("speaker", "patchouli:3").is_err() && b.set("speaker", "patchouli:fast").is_err() && b.set("speaker", ":1.2").is_err());
         assert!(b.set("persona", "/no/such/file.md").is_err());
         let f = std::env::temp_dir().join("catapp-test-patchouli-knowledge.md");
         std::fs::write(&f, "persona").unwrap();
