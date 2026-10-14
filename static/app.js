@@ -860,14 +860,28 @@ async function loadAvatar(url) {
   const model = await PIXI.live2d.Live2DModel.from(url);
   pixi.stage.addChild(model);
   voice.avatar = model;
-  // Head and shoulders: scale so the top ~36% of the model fills the box (the sides may crop).
+  // Three framings, picked by clicking the avatar: close-up (the default), half and whole. The
+  // first two fill the box with the top part of the model and may crop the sides; full-body
+  // models (much taller than wide) need a smaller part for the same head-and-shoulders view.
+  const tall = model.internalModel.height > 1.6 * model.internalModel.width;
+  const views = tall ? [0.36, 0.6, 1] : [0.65, 0.85, 1];
   const fit = () => {
     const w = el.clientWidth, h = el.clientHeight;
-    const s = h / (model.internalModel.height * 0.36);
-    model.scale.set(s);
-    model.anchor.set(0.5, 0);
-    model.position.set(w / 2, 0);
+    if (!w || !h) return;
+    const mw = model.internalModel.width, mh = model.internalModel.height;
+    const part = views[pref.avatarView || 0] || views[0];
+    if (part < 1) {
+      model.scale.set(h / (mh * part));
+      model.anchor.set(0.5, 0);
+      model.position.set(w / 2, 0);
+    } else {
+      model.scale.set(Math.min(w / mw, h / mh) * 0.96);
+      model.anchor.set(0.5, 0.5);
+      model.position.set(w / 2, h / 2);
+    }
   };
+  el.title = 'Click to change the framing';
+  el.onclick = () => { pref.avatarView = ((pref.avatarView || 0) + 1) % views.length; savePref(); fit(); };
   fit();
   new ResizeObserver(fit).observe(el);
   pixi.ticker.add(() => {
