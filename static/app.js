@@ -219,7 +219,7 @@ function todoPanel(todo) {
   const more = allOpen.length - open.length;
   return `
     <div class="panel todo">
-      <h2>To do <a class="hint" href="#/p/${TODO_SLUG}">${done ? `${done} done · ` : ''}all</a></h2>
+      <h2>To do <span>${allOpen.length > 1 ? `<button class="ghost" data-todoorder aria-pressed="${!!pref.newestTasksFirst}" title="Change to-do order">${pref.newestTasksFirst ? 'Newest first' : 'Oldest first'}</button> ` : ''}<a class="hint" href="#/p/${TODO_SLUG}">${done ? `${done} done · ` : ''}all</a></span></h2>
       ${open.length ? `<ul class="tasks">${open.map(t => `
         <li>
           <input type="checkbox" data-todo="${t.id}" aria-label="${esc(t.text)}">
@@ -231,6 +231,8 @@ function todoPanel(todo) {
 
 function wireTodo(todo) {
   if (!todo) return;
+  const order = app.querySelector('[data-todoorder]');
+  if (order) order.onclick = () => { pref.newestTasksFirst = !pref.newestTasksFirst; savePref(); renderHome(); };
   app.querySelectorAll('.todo .t').forEach(t => t.onclick = e => {
     if (e.target.tagName !== 'A') t.classList.toggle('open');
   });
