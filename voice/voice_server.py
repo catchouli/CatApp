@@ -48,6 +48,13 @@ def speakable(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def short_error(e: Exception) -> str:
+    """The useful part of an error: ffmpeg's start with its version banner, so keep the end."""
+    lines = [l.strip() for l in str(e).replace("\\n", "\n").splitlines() if l.strip()]
+    text = lines[0] if len(lines) < 2 else f"{lines[0].split(': ffmpeg version')[0][:80]}: {lines[-1]}"
+    return f"{type(e).__name__}: {text}"[:300]
+
+
 class Voice:
     def __init__(self, home: Path):
         from kokoro_onnx import Kokoro
@@ -123,7 +130,8 @@ def main() -> None:
                 out = {"error": f"unknown op {op!r}"}
             log(f"{op} in {time.time() - t0:.2f}s")
         except Exception as e:  # keep serving; report the failure to CatApp
-            out = {"error": f"{type(e).__name__}: {e}"[:300]}
+            log(f"{req.get('op') if isinstance(req, dict) else '?'} failed: {type(e).__name__}: {e}")
+            out = {"error": short_error(e)}
         print(json.dumps(out), flush=True)
 
 

@@ -594,7 +594,7 @@ const voice = {
   ctx: null, out: null, level: null,  // audio context, output analyser, its sample buffer
   queue: [], source: null, gen: 0,    // sentences waiting to play, the one playing
   buf: '',                            // reply text not yet spoken
-  rec: null, cancelled: false, stream: null,
+  rec: null, cancelled: false, stream: null, opening: false,
   lastUse: Date.now(),
   mouth: 0,
 };
@@ -764,12 +764,15 @@ async function startTalking() {
   audio();
   stopSpeaking();
   let stream;
+  voice.opening = true; // the mic takes a moment to open after the panel's been closed; ignore taps meanwhile
   try {
     stream = await micStream();
   } catch (e) {
     toast(window.isSecureContext ? "The microphone is blocked: allow it for this page in the browser's settings."
       : 'The microphone only works over HTTPS (or on the computer running the app).', true);
     return;
+  } finally {
+    voice.opening = false;
   }
   const rec = new MediaRecorder(stream);
   const chunks = [];
@@ -789,11 +792,12 @@ async function startTalking() {
     mic.setAttribute('aria-pressed', 'false');
     mic.style.removeProperty('--level');
     if (voice.cancelled) return;
-    if (!heard) { toast("Didn't catch that"); return; }
+    const blob = new Blob(chunks, { type: rec.mimeType });
+    // A recording stopped straight away is just a file header, which the server can't read.
+    if (!heard || blob.size < 1000) { toast("Didn't catch that"); return; }
     mic.classList.add('busy');
     drawAsk('Listening…');
     try {
-      const blob = new Blob(chunks, { type: rec.mimeType });
       const r = await fetch('/api/voice/stt', { method: 'POST', body: blob });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data.error || r.statusText);
@@ -824,7 +828,7 @@ async function startTalking() {
 document.addEventListener('visibilitychange', () => { if (document.hidden && meta.voice) closeMic(); });
 
 mic.onclick = () => {
-  if (mic.classList.contains('busy') || ask.send.disabled) return;
+  if (mic.classList.contains('busy') || ask.send.disabled || voice.opening) return;
   if (voice.rec) voice.rec.stop(); // tap again: send now
   else startTalking();
 };

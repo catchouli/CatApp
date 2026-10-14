@@ -478,6 +478,11 @@ async fn voice_stt(State(st): St, body: Bytes) -> R {
     let clip = dir.join(format!("clip-{}.audio", rand::random::<u64>()));
     std::fs::write(&clip, &body).map_err(|e| db::Error::Invalid(e.to_string()))?;
     let r = st.voice.speech(&st.home, json!({ "op": "stt", "path": clip })).await;
+    if r.is_err() {
+        // Keep the last clip that failed, to look at.
+        eprintln!("stt failed on a {}-byte clip, kept as voice/tmp/failed.audio", body.len());
+        let _ = std::fs::rename(&clip, dir.join("failed.audio"));
+    }
     let _ = std::fs::remove_file(&clip);
     ok(r?)
 }
