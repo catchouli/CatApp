@@ -857,7 +857,14 @@ async function loadAvatar(url) {
   document.body.classList.add('voice-avatar');
   const pixi = new PIXI.Application({ backgroundAlpha: 0, resizeTo: el, antialias: true, autoDensity: true, resolution: devicePixelRatio || 1 });
   el.appendChild(pixi.view);
-  const model = await PIXI.live2d.Live2DModel.from(url);
+  // Her eyes follow the pointer, only while the panel is showing: the library's own tracking
+  // kept going while it was hidden, divided by the canvas's zero size and broke the model.
+  const model = await PIXI.live2d.Live2DModel.from(url, { autoInteract: false });
+  document.addEventListener('pointermove', e => {
+    if (ask.panel.hidden || !el.clientWidth) return;
+    const r = el.getBoundingClientRect();
+    model.focus(e.clientX - r.left, e.clientY - r.top);
+  });
   pixi.stage.addChild(model);
   voice.avatar = model;
   // Three framings, picked by clicking the avatar: close-up (the default), half and whole. The
