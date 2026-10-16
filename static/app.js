@@ -131,9 +131,11 @@ setInterval(() => { if (!document.hidden && !busyTyping()) render(); }, 60000);
 
 async function renderHome() {
   const [allProjects, recent] = await Promise.all([api('GET', '/api/projects'), api('GET', '/api/recent?limit=12')]);
-  // The project with slug "todo" is the general to-do list: shown as a panel, not a card.
-  const todo = allProjects.some(p => p.slug === TODO_SLUG) ? await api('GET', `/api/projects/${TODO_SLUG}`) : null;
-  const projects = allProjects.filter(p => p.slug !== TODO_SLUG);
+  // The built-in lists (to-do, ideas) are projects shown as panels, not cards. Adding to one
+  // that doesn't exist yet makes it.
+  const lists = await Promise.all(LISTS.map(l => allProjects.some(p => p.slug === l.slug)
+    ? api('GET', `/api/projects/${l.slug}`) : { slug: l.slug, tasks: [] }));
+  const projects = allProjects.filter(p => !LIST_SLUGS.includes(p.slug));
   const filter = pref.filter || 'all';
   const showFinished = !!pref.showFinished;
   const cats = catOrder([...new Set(projects.map(p => p.category))]);
@@ -162,7 +164,7 @@ async function renderHome() {
         ${groups || `<div class="panel"><p class="empty">No projects here yet.</p><a class="btn primary" href="#/new">New project</a></div>`}
       </div>
       <aside>
-        ${todoPanel(todo)}
+        ${LISTS.map((l, i) => listPanel(l, lists[i])).join('')}
         ${active.length ? `
         <div class="panel quick">
           <h2>Quick note</h2>
@@ -203,54 +205,116 @@ async function renderHome() {
     qs.onclick = send;
     submitOnCmdEnter(qn, send);
   }
-  wireTodo(todo);
+  LISTS.forEach((l, i) => wireList(l, lists[i]));
 }
 
-// ---- to-do list -------------------------------------------------------------------
+// ---- to-do and ideas lists ---------------------------------------------------------
 
 const TODO_SLUG = 'todo';
-const TODO_SHOWN = 8;
+const LISTS = [
+  { slug: TODO_SLUG, title: 'To do', shown: 8, add: 'Add a to-do', empty: 'Nothing to do. Nice.' },
+  { slug: 'ideas', title: 'Ideas', shown: 5, add: 'Add an idea', empty: 'Nothing yet. Jot ideas down here so they don\'t get lost.' },
+];
+const LIST_SLUGS = LISTS.map(l => l.slug);
 
-function todoPanel(todo) {
-  if (!todo) return '';
-  const allOpen = (pref.newestTasksFirst ? [...todo.tasks].reverse() : todo.tasks).filter(t => !t.done);
-  const done = todo.tasks.length - allOpen.length;
-  const open = allOpen.slice(0, TODO_SHOWN);
+function listPanel(l, list) {
+  const allOpen = (pref.newestTasksFirst ? [...list.tasks].reverse() : list.tasks).filter(t => !t.done);
+  const done = list.tasks.length - allOpen.length;
+  const open = allOpen.slice(0, l.shown);
   const more = allOpen.length - open.length;
+  const all = `#/p/${l.slug}`;
   return `
-    <div class="panel todo">
-      <h2>To do <span>${allOpen.length > 1 ? `<button class="ghost" data-todoorder aria-pressed="${!!pref.newestTasksFirst}" title="Change to-do order">${pref.newestTasksFirst ? 'Newest first' : 'Oldest first'}</button> ` : ''}<a class="hint" href="#/p/${TODO_SLUG}">${done ? `${done} done · ` : ''}all</a></span></h2>
+    <div class="panel todo" data-list="${l.slug}">
+      <h2>${esc(l.title)} <span>${allOpen.length > 1 ? `<button class="ghost" data-listorder aria-pressed="${!!pref.newestTasksFirst}" title="Change the order">${pref.newestTasksFirst ? 'Newest first' : 'Oldest first'}</button> ` : ''}${list.id ? `<a class="hint" href="${all}">${done ? `${done} done · ` : ''}all</a>` : ''}</span></h2>
       ${open.length ? `<ul class="tasks">${open.map(t => `
         <li>
-          <input type="checkbox" data-todo="${t.id}" aria-label="${esc(t.text)}">
+          <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
           <span class="t" title="Tap to expand">${rich(t.text)}</span>
-        </li>`).join('')}</ul>${more ? `<p class="hint" style="margin:0 0 10px"><a href="#/p/${TODO_SLUG}">+ ${more} more</a></p>` : ''}` : '<p class="empty">Nothing to do. Nice.</p>'}
-      <form id="todo-form" class="row"><input id="todo-in" placeholder="Add a to-do" aria-label="New to-do" style="flex:1;min-width:0"><button>Add</button></form>
+          ${moveButton(t)}
+        </li>`).join('')}</ul>${more ? `<p class="hint" style="margin:0 0 10px"><a href="${all}">+ ${more} more</a></p>` : ''}` : `<p class="empty">${esc(l.empty)}</p>`}
+      <form class="row" data-listadd><input placeholder="${esc(l.add)}" aria-label="${esc(l.add)}" style="flex:1;min-width:0"><button>Add</button></form>
     </div>`;
 }
 
-function wireTodo(todo) {
-  if (!todo) return;
-  const order = app.querySelector('[data-todoorder]');
+function wireList(l, list) {
+  const panel = app.querySelector(`[data-list="${l.slug}"]`);
+  const order = panel.querySelector('[data-listorder]');
   if (order) order.onclick = () => { pref.newestTasksFirst = !pref.newestTasksFirst; savePref(); renderHome(); };
-  app.querySelectorAll('.todo .t').forEach(t => t.onclick = e => {
+  panel.querySelectorAll('.t').forEach(t => t.onclick = e => {
     if (e.target.tagName !== 'A') t.classList.toggle('open');
   });
-  app.querySelectorAll('[data-todo]').forEach(cb => cb.onchange = () => guard(async () => {
-    await api('PATCH', `/api/tasks/${cb.dataset.todo}`, { done: cb.checked });
+  panel.querySelectorAll('[data-tick]').forEach(cb => cb.onchange = () => guard(async () => {
+    await api('PATCH', `/api/tasks/${cb.dataset.tick}`, { done: cb.checked });
     toast('Done ✓');
     renderHome();
   }));
-  document.getElementById('todo-form').onsubmit = e => {
+  wireMoves(panel, list, renderHome);
+  const form = panel.querySelector('[data-listadd]');
+  form.onsubmit = e => {
     e.preventDefault();
-    const inp = document.getElementById('todo-in');
+    const inp = form.querySelector('input');
     if (!inp.value.trim()) return inp.focus();
     guard(async () => {
-      await api('POST', `/api/projects/${TODO_SLUG}/tasks`, { text: inp.value });
+      await api('POST', `/api/projects/${l.slug}/tasks`, { text: inp.value });
       await renderHome();
-      document.getElementById('todo-in').focus();
+      app.querySelector(`[data-list="${l.slug}"] [data-listadd] input`).focus();
     });
   };
+}
+
+// ---- moving a task to another project or list ------------------------------------------
+
+const moveIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12h13M12 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const moveButton = t => `<button class="ghost x" data-move="${t.id}" aria-label="Move to another project" title="Move to another project">${moveIcon}</button>`;
+
+function wireMoves(root, project, after) {
+  root.querySelectorAll('[data-move]').forEach(b => b.onclick = () => {
+    const t = project.tasks.find(x => String(x.id) === b.dataset.move);
+    if (t) openMove(t, project.slug, after);
+  });
+}
+
+// A picker: the lists first, then unfinished projects (most recently active first). Typing
+// filters by name, and finds finished projects too.
+async function openMove(task, from, after) {
+  const projects = await guard(() => api('GET', '/api/projects'));
+  if (!projects) return;
+  const targets = [
+    ...LISTS.filter(l => l.slug !== from).map(l => ({ slug: l.slug, name: l.title, list: true })),
+    ...projects.filter(p => !LIST_SLUGS.includes(p.slug) && p.slug !== from)
+      .sort((a, b) => b.last_activity.localeCompare(a.last_activity))
+      .map(p => ({ slug: p.slug, name: p.name, status: p.status, finished: FINISHED.includes(p.status) })),
+  ];
+  const dlg = document.getElementById('move');
+  dlg.innerHTML = `
+    <form method="dialog" class="move">
+      <header><strong>Move to…</strong><button class="ghost" value="cancel" aria-label="Close">✕</button></header>
+      <p class="move-task">${esc(task.text)}</p>
+      <input type="search" placeholder="Find a project" aria-label="Find a project" autocomplete="off">
+      <ul class="move-list"></ul>
+    </form>`;
+  const input = dlg.querySelector('input'), ul = dlg.querySelector('ul');
+  const draw = () => {
+    const q = input.value.trim().toLowerCase();
+    const hits = targets.filter(t => q ? t.name.toLowerCase().includes(q) || t.slug.includes(q) : !t.finished);
+    ul.innerHTML = hits.map(t => `<li><button type="button" data-to="${esc(t.slug)}"><span>${esc(t.name)}</span>${t.list ? '<span class="hint">list</span>' : pill(t.status)}</button></li>`).join('')
+      || '<li class="empty">No projects match.</li>';
+    ul.querySelectorAll('[data-to]').forEach(b => b.onclick = () => guard(async () => {
+      await api('POST', `/api/tasks/${task.id}/move`, { project: b.dataset.to });
+      dlg.close();
+      toast(`Moved to ${targets.find(x => x.slug === b.dataset.to).name}`);
+      after();
+    }));
+  };
+  input.oninput = draw;
+  // Enter picks the first match.
+  input.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); const first = ul.querySelector('[data-to]'); if (first) first.click(); }
+  };
+  dlg.onclick = e => { if (e.target === dlg) dlg.close(); }; // a click on the backdrop
+  draw();
+  dlg.showModal();
+  if (matchMedia('(hover: hover)').matches) input.focus();
 }
 
 function card(p) {
@@ -320,6 +384,7 @@ async function renderProject(slug) {
           <li class="${t.done ? 'done' : ''}">
             <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
             <span class="t">${rich(t.text)}</span>
+            ${moveButton(t)}
             <button class="ghost x" data-deltask="${t.id}" aria-label="Delete task">✕</button>
           </li>`).join('')}</ul>
         <form id="task-form" class="row"><input id="task" placeholder="Add a task" aria-label="New task" style="flex:1;min-width:0"><button>Add</button></form>
@@ -423,6 +488,7 @@ async function renderProject(slug) {
     await api('PATCH', `/api/tasks/${cb.dataset.task}`, { done: cb.checked });
     renderProject(p.slug);
   }));
+  wireMoves(app.querySelector('.a-tasks'), p, () => renderProject(p.slug));
   app.querySelectorAll('[data-deltask]').forEach(b => b.onclick = () => guard(async () => {
     await api('DELETE', `/api/tasks/${b.dataset.deltask}`);
     renderProject(p.slug);

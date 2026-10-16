@@ -15,7 +15,7 @@ made my own.
 
 Every project gets a status, a next step, a checklist and a log of dated notes, so
 picking something back up is just a case of reading what past me wrote. There's a
-to-do list on the front page for everything else.
+to-do list and an ideas list on the front page for everything else.
 
 It's also built for working with AI agents. Claude (or any other agent) can read it and
 post notes over MCP, so when an agent finishes some work in one of my repos it leaves a

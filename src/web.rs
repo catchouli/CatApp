@@ -68,6 +68,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{slug}/tasks", post(add_task))
         .route("/api/notes/{id}", patch(edit_note).delete(delete_note))
         .route("/api/tasks/{id}", patch(update_task).delete(delete_task))
+        .route("/api/tasks/{id}/move", post(move_task))
         .route("/api/recent", get(recent))
         .route("/api/search", get(search))
         .route("/api/assistant", post(assistant))
@@ -259,8 +260,19 @@ struct TaskBody {
 
 async fn add_task(State(st): St, Path(slug): Path<String>, Json(b): Json<TaskBody>) -> R {
     let db = st.db.lock().unwrap();
-    let p = db.find(&slug)?;
+    let p = db.find_or_list(&slug, &Brand::load(&st.home).owner, "web")?;
     ok(db.add_task(p.id, &b.text)?)
+}
+
+#[derive(Deserialize)]
+struct MoveBody {
+    project: String,
+}
+
+async fn move_task(State(st): St, Path(id): Path<i64>, Json(b): Json<MoveBody>) -> R {
+    let db = st.db.lock().unwrap();
+    let p = db.find_or_list(&b.project, &Brand::load(&st.home).owner, "web")?;
+    ok(db.move_task(id, p.id)?)
 }
 
 async fn update_task(State(st): St, Path(id): Path<i64>, Json(b): Json<TaskPatch>) -> R {
@@ -322,6 +334,8 @@ pub(crate) fn assistant_prompt(b: &Brand) -> String {
 on their phone: \"add a project for X\", \"add a to-do to Y\", \"note on <project> that Z\", \"what's next on \
 <project>?\". Use the {slug} tools to do it, then reply in one or two short plain sentences saying exactly what you \
 did (name the project). The to-do list is the project with slug 'todo': add to-dos there with add_task. \
+The ideas list is the project with slug 'ideas': \"add an idea\", \"idea: ...\" go there. To move a task to another project \
+or list, use update_task with project. \
 \"the to-do list\", \"my to-dos\", \"the main list\" and any to-do that doesn't name a project all mean that list: add it \
 there without searching or asking which project. New projects \
 default to category 'personal' and status 'active' unless {owner} says otherwise. Pass source 'assistant' when adding \

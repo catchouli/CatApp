@@ -40,15 +40,19 @@ Your data lives in `~/Library/Application Support/catapp/` on macOS and `~/.loca
 - It's plain HTTP on your home network, protected by the token. Away from home, use a private network like Tailscale. Don't expose it to the internet.
 - To rename a Mac (and so its `.local` address): `sudo scutil --set LocalHostName newname` (also `ComputerName` and `HostName`). On Linux: `sudo hostnamectl hostname newname`.
 
-## To-do list
+## To-do list and ideas
 
-The project with slug `todo` is the general to-do list. It shows at the top of the home page (first eight items; tap one to expand, tick to finish) instead of as a project card.
+The project with slug `todo` is the general to-do list, and `ideas` is a list of things to maybe do some day. They show on the home page (to-dos first, eight items, then five ideas; tap one to expand, tick to finish) instead of as project cards. Each is made the first time you add to it.
 
 ```sh
-catapp todo                  # show open items (creates the list the first time)
+catapp todo                  # show open items
 catapp todo pay the gas bill # add one
+catapp idea learn to juggle  # add an idea (`catapp idea` lists them)
 catapp task done 76          # tick one off
+catapp task mv 76 blender    # move it to a project (or to todo, ideas)
 ```
+
+To move a task in the app, press the arrow next to it (on a project page or in the home-page lists; on desktop it shows when you hover) and pick where it goes. Type to filter; finished projects only show up when you search for them.
 
 ## Assistant
 
@@ -95,8 +99,9 @@ AI agents working in your repos can post short status notes to the matching proj
 | `catapp note blender "text"` | Add a note; no text means read stdin. `.` = this folder's project; `--source name` for agents |
 | `catapp set blender -s paused -n "next thing"` | Change status / next step / `--summary` / `--name` / `-c` / `--links` |
 | `catapp new "Name" -c work -n "first step"` | New project |
-| `catapp task add blender "thing"` / `task done 12` / `task undo 12` / `task rm 12` | Checklist |
+| `catapp task add blender "thing"` / `task done 12` / `task undo 12` / `task mv 12 ideas` / `task rm 12` | Checklist |
 | `catapp todo` / `catapp todo "thing"` | The to-do list |
+| `catapp idea` / `catapp idea "thing"` | The ideas list |
 | `catapp recent` / `catapp search word` | Latest notes / search everything |
 | `catapp export > snapshot.md` | Everything as Markdown |
 | `catapp config` | Settings: name, owner, icon, port, voice, speaker, persona, memory, avatar |
