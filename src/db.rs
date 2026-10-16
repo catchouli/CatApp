@@ -757,14 +757,14 @@ mod tests {
     #[test]
     fn create_find_update() {
         let db = Db::memory().unwrap();
-        let a = db.create(new("VRAssist local-first", "Work"), "test").unwrap();
-        let b = db.create(new("VRAssist fine-tune", "work"), "test").unwrap();
-        db.create(new("VRAssist fine-tune", "work"), "test").unwrap(); // slug gets -2
+        let a = db.create(new("Home lab backups", "Work"), "test").unwrap();
+        let b = db.create(new("Home lab network", "work"), "test").unwrap();
+        db.create(new("Home lab network", "work"), "test").unwrap(); // slug gets -2
         assert_eq!(a.category, "work");
-        assert_eq!(db.find("vrassist-local-first").unwrap().id, a.id);
-        assert_eq!(db.find("local-first").unwrap().id, a.id);
-        assert_eq!(db.find("vrassist fine-tune").unwrap().id, b.id);
-        assert!(matches!(db.find("vrassist"), Err(Error::Invalid(_))));
+        assert_eq!(db.find("home-lab-backups").unwrap().id, a.id);
+        assert_eq!(db.find("backups").unwrap().id, a.id);
+        assert_eq!(db.find("home lab network").unwrap().id, b.id);
+        assert!(matches!(db.find("home lab"), Err(Error::Invalid(_))));
         assert!(matches!(db.find("nothing"), Err(Error::NotFound(_))));
 
         let p = db.update(a.id, ProjectPatch { status: Some("paused".into()), next_step: Some("Evals".into()), ..Default::default() }, "test").unwrap();
