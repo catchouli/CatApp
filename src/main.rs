@@ -9,14 +9,12 @@ mod voice;
 mod web;
 
 use clap::{Parser, Subcommand};
-use db::{Db, NewProject, Note, Project, ProjectPatch, TaskPatch, STATUSES};
+use db::{Db, NewProject, Note, Project, ProjectPatch, TaskPatch, IDEAS_SLUG, STATUSES, TODO_SLUG};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-/// The project that holds the general to-do list.
-const TODO_SLUG: &str = "todo";
 
 #[derive(Parser)]
 #[command(name = "catapp", version, about = "A personal organiser: projects, tasks and notes (CatApp, or whatever you name it)")]
@@ -116,6 +114,14 @@ enum Cmd {
         #[arg(short, long)]
         all: bool,
     },
+    /// Your ideas list: `catapp idea` shows it, `catapp idea some thing` adds to it
+    #[command(alias = "ideas")]
+    Idea {
+        text: Vec<String>,
+        /// Include done items
+        #[arg(short, long)]
+        all: bool,
+    },
     /// Latest notes across all projects
     Recent {
         #[arg(short, long, default_value_t = 15)]
@@ -159,6 +165,8 @@ enum TaskCmd {
     Done { id: i64 },
     /// Mark a task not done
     Undo { id: i64 },
+    /// Move a task to another project (or `todo`, `ideas`)
+    Mv { id: i64, project: String },
     /// Delete a task
     Rm { id: i64 },
 }
@@ -270,6 +278,26 @@ fn text_or_stdin(words: Vec<String>) -> Result<String, String> {
     let mut s = String::new();
     std::io::stdin().read_to_string(&mut s).map_err(|e| e.to_string())?;
     Ok(s.trim().to_string())
+}
+
+/// `catapp todo` and `catapp idea`: show a built-in list, or add to it.
+fn list_cmd(slug: &str, text: Vec<String>, all: bool, empty: &str) -> Result<(), String> {
+    let db = open_db()?;
+    let p = db.ensure_list(slug, &brand::Brand::load(&home()).owner, "cli").map_err(|e| e.to_string())?;
+    if !text.is_empty() {
+        let t = db.add_task(p.id, &text.join(" ")).map_err(|e| e.to_string())?;
+        println!("Added #{}: {}", t.id, t.text);
+        return Ok(());
+    }
+    let tasks = db.tasks(p.id).map_err(|e| e.to_string())?;
+    let shown: Vec<_> = tasks.iter().filter(|t| all || !t.done).collect();
+    if shown.is_empty() {
+        println!("{empty}");
+    }
+    for t in shown {
+        println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
+    }
+    Ok(())
 }
 
 fn json_out<T: serde::Serialize>(v: &T) {
@@ -412,7 +440,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let db = open_db()?;
             match cmd {
                 TaskCmd::Add { project, text } => {
-                    let p = db.find(&project).map_err(e)?;
+                    let p = db.find_or_list(&project, &brand::Brand::load(&home()).owner, "cli").map_err(e)?;
                     let t = db.add_task(p.id, &text_or_stdin(text)?).map_err(e)?;
                     println!("Added task #{} to {}", t.id, p.name);
                 }
@@ -421,50 +449,19 @@ fn run(cli: Cli) -> Result<(), String> {
                     let t = db.update_task(id, TaskPatch { done: Some(done), text: None }).map_err(e)?;
                     println!("[{}] {}", if t.done { "x" } else { " " }, t.text);
                 }
+                TaskCmd::Mv { id, project } => {
+                    let p = db.find_or_list(&project, &brand::Brand::load(&home()).owner, "cli").map_err(e)?;
+                    let t = db.move_task(id, p.id).map_err(e)?;
+                    println!("Moved #{} to {}: {}", t.id, p.name, t.text);
+                }
                 TaskCmd::Rm { id } => {
                     db.delete_task(id).map_err(e)?;
                     println!("Deleted task #{id}");
                 }
             }
         }
-        Cmd::Todo { text, all } => {
-            let db = open_db()?;
-            let p = match db.find(TODO_SLUG) {
-                Ok(p) if p.slug == TODO_SLUG => p,
-                _ => {
-                    // Created as "Todo" so the slug is exactly "todo", then given a friendlier name
-                    // (slugs never change on rename).
-                    let p = db
-                        .create(
-                            NewProject {
-                                name: "Todo".into(),
-                                category: Some("personal".into()),
-                                summary: Some(format!(
-                                    "{}'s general to-do list. Shown at the top of the home page.",
-                                    brand::Brand::load(&home()).owner
-                                )),
-                                ..Default::default()
-                            },
-                            "cli",
-                        )
-                        .map_err(e)?;
-                    db.update(p.id, ProjectPatch { name: Some("To do".into()), ..Default::default() }, "cli").map_err(e)?
-                }
-            };
-            if !text.is_empty() {
-                let t = db.add_task(p.id, &text.join(" ")).map_err(e)?;
-                println!("Added #{}: {}", t.id, t.text);
-                return Ok(());
-            }
-            let tasks = db.tasks(p.id).map_err(e)?;
-            let shown: Vec<_> = tasks.iter().filter(|t| all || !t.done).collect();
-            if shown.is_empty() {
-                println!("Nothing to do. Add something: catapp todo buy milk");
-            }
-            for t in shown {
-                println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
-            }
-        }
+        Cmd::Todo { text, all } => list_cmd(TODO_SLUG, text, all, "Nothing to do. Add something: catapp todo buy milk")?,
+        Cmd::Idea { text, all } => list_cmd(IDEAS_SLUG, text, all, "No ideas yet. Add one: catapp idea learn to juggle")?,
         Cmd::Recent { limit, category } => {
             let db = open_db()?;
             let cat = category.as_deref().map(db::norm_category);
