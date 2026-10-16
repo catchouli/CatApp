@@ -16,7 +16,8 @@ absolute path of a folder in the project (your working directory finds the proje
 of a working session, post one short status note (at most 3 lines: what changed, what's next, anything blocked) \
 with your agent name as `source`, and update the next step if it changed. Don't create projects unless asked. \
 {owner}'s general to-do list is the project 'todo': add things there that {owner} needs to do or decide (add_task \
-with project 'todo'), because things only mentioned in chat get forgotten."
+with project 'todo'), because things only mentioned in chat get forgotten. {owner}'s ideas list is the project \
+'ideas' (things to maybe do some day). To move a task to another project or list, use update_task with `project`."
     )
 }
 
@@ -82,9 +83,10 @@ fn tools() -> Value {
         },
         {
             "name": "update_task",
-            "description": "Tick or untick a task, or change its text. Task ids come from get_project.",
+            "description": "Tick or untick a task, change its text, or move it to another project (e.g. from 'todo' to a project, or to 'ideas'). Task ids come from get_project.",
             "inputSchema": { "type": "object", "required": ["task_id"], "properties": {
-                "task_id": { "type": "integer" }, "done": { "type": "boolean" }, "text": { "type": "string" }
+                "task_id": { "type": "integer" }, "done": { "type": "boolean" }, "text": { "type": "string" },
+                "project": { "type": "string", "description": "Move the task to the end of this project's checklist" }
             }}
         },
         {
@@ -128,12 +130,12 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("update_project", &["project", "name", "category", "status", "summary", "next_step", "links", "source"]),
     ("create_project", &["name", "category", "status", "summary", "next_step", "links"]),
     ("add_task", &["project", "text"]),
-    ("update_task", &["task_id", "done", "text"]),
+    ("update_task", &["task_id", "done", "text", "project"]),
     ("recent_notes", &["limit", "category"]),
     ("search", &["query"]),
 ];
 
-fn call(db: &Db, name: &str, a: &Value) -> Result<Value, String> {
+fn call(db: &Db, owner: &str, name: &str, a: &Value) -> Result<Value, String> {
     let known = KNOWN.iter().find(|(n, _)| *n == name).ok_or_else(|| format!("unknown tool '{name}'"))?.1;
     if let Some(obj) = a.as_object() {
         if let Some(bad) = obj.keys().find(|k| !known.contains(&k.as_str())) {
@@ -194,11 +196,15 @@ fn call(db: &Db, name: &str, a: &Value) -> Result<Value, String> {
             v(&db.create(np, "claude").map_err(e)?)
         }
         "add_task" => {
-            let p = db.find(need(a, "project")?).map_err(e)?;
+            let p = db.find_or_list(need(a, "project")?, owner, "claude").map_err(e)?;
             v(&db.add_task(p.id, need(a, "text")?).map_err(e)?)
         }
         "update_task" => {
             let id = a.get("task_id").and_then(Value::as_i64).ok_or("missing 'task_id'")?;
+            if let Some(to) = s(a, "project") {
+                let p = db.find_or_list(to, owner, "claude").map_err(e)?;
+                db.move_task(id, p.id).map_err(e)?;
+            }
             let patch = TaskPatch { text: owned(a, "text"), done: a.get("done").and_then(Value::as_bool) };
             v(&db.update_task(id, patch).map_err(e)?)
         }
@@ -237,7 +243,7 @@ fn handle(db: &Db, brand: &Brand, msg: &Value) -> Option<Value> {
         "tools/call" => {
             let name = msg["params"]["name"].as_str().unwrap_or("");
             let args = msg["params"].get("arguments").cloned().unwrap_or(json!({}));
-            match call(db, name, &args) {
+            match call(db, &brand.owner, name, &args) {
                 Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap() }] }),
                 Err(err) => json!({ "content": [{ "type": "text", "text": err }], "isError": true }),
             }
