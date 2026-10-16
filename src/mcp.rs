@@ -15,8 +15,9 @@ checklist of tasks and a log of dated notes. Projects can be named by slug, id, 
 absolute path of a folder in the project (your working directory finds the project you're working in). At the end \
 of a working session, post one short status note (at most 3 lines: what changed, what's next, anything blocked) \
 with your agent name as `source`, and update the next step if it changed. Don't create projects unless asked. \
-{owner}'s general to-do list is the project 'todo': add things there that {owner} needs to do or decide (add_task \
-with project 'todo'), because things only mentioned in chat get forgotten. {owner}'s ideas list is the project \
+{owner}'s general to-do list is the project 'todo' (add_task with project 'todo'). Add to it only when {owner} asks, \
+or for something that genuinely needs {owner} after the session and only after asking {owner} first: questions \
+and decisions you can settle by asking {owner} in the conversation aren't to-dos. {owner}'s ideas list is the project \
 'ideas' (things to maybe do some day). To move a task to another project or list, use update_task with `project`."
     )
 }
