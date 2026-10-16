@@ -14,6 +14,19 @@ pub const STATUSES: &[&str] = &["active", "planned", "idea", "paused", "done", "
 /// Statuses meaning no more work is planned: hidden from default lists.
 pub const FINISHED: &[&str] = &["done", "abandoned", "archived"];
 
+/// The built-in lists: projects with these slugs show as panels on the home page, not as cards.
+pub const TODO_SLUG: &str = "todo";
+pub const IDEAS_SLUG: &str = "ideas";
+
+/// A built-in list's name and summary, or None if `slug` isn't one.
+pub fn builtin_list(slug: &str, owner: &str) -> Option<(&'static str, String)> {
+    match slug {
+        TODO_SLUG => Some(("To do", format!("{owner}'s general to-do list. Shown at the top of the home page."))),
+        IDEAS_SLUG => Some(("Ideas", format!("{owner}'s ideas: things to maybe do some day. Shown on the home page."))),
+        _ => None,
+    }
+}
+
 pub fn is_finished(status: &str) -> bool {
     FINISHED.contains(&status)
 }
@@ -607,6 +620,48 @@ impl Db {
         self.task(id)
     }
 
+    /// Moves a task to the end of another project's checklist. Both projects count it as activity.
+    pub fn move_task(&self, id: i64, project_id: i64) -> Result<Task> {
+        let cur = self.task(id)?;
+        self.project_by_id(project_id)?;
+        if cur.project_id == project_id {
+            return Ok(cur);
+        }
+        let pos: i64 =
+            self.conn.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM tasks WHERE project_id = ?1", [project_id], |r| r.get(0))?;
+        self.conn.execute("UPDATE tasks SET project_id = ?1, position = ?2 WHERE id = ?3", params![project_id, pos, id])?;
+        self.touch(cur.project_id)?;
+        self.touch(project_id)?;
+        self.task(id)
+    }
+
+    /// A built-in list (see `builtin_list`), made the first time it's needed. It's created under
+    /// its slug so the slug is exact, then renamed (slugs never change on rename).
+    pub fn ensure_list(&self, slug: &str, owner: &str, source: &str) -> Result<Project> {
+        let (name, summary) = builtin_list(slug, owner).ok_or_else(|| Error::Invalid(format!("'{slug}' isn't a built-in list")))?;
+        if let Some(p) = self.projects()?.into_iter().find(|p| p.slug == slug) {
+            return Ok(p);
+        }
+        let p = self.create(
+            NewProject { name: slug.into(), category: Some("personal".into()), summary: Some(summary), ..Default::default() },
+            source,
+        )?;
+        if p.slug != slug {
+            self.delete_project(p.id)?;
+            return Err(Error::Invalid(format!("couldn't make the '{slug}' list")));
+        }
+        self.update(p.id, ProjectPatch { name: Some(name.into()), ..Default::default() }, source)
+    }
+
+    /// `find`, except that a built-in list's slug always means that list (made if need be), never a
+    /// project whose name happens to contain the word.
+    pub fn find_or_list(&self, query: &str, owner: &str, source: &str) -> Result<Project> {
+        match builtin_list(query.trim(), owner) {
+            Some(_) => self.ensure_list(query.trim(), owner, source),
+            None => self.find(query),
+        }
+    }
+
     pub fn delete_task(&self, id: i64) -> Result<()> {
         let cur = self.task(id)?;
         self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
@@ -753,5 +808,28 @@ mod tests {
         let (_, notes, tasks) = db.search("3dgs").unwrap();
         assert_eq!((notes.len(), tasks.len()), (1, 0));
         assert!(db.export_markdown(3, "CatApp").unwrap().contains("- [x] Viewer"));
+    }
+
+    #[test]
+    fn move_tasks_and_lists() {
+        let db = Db::memory().unwrap();
+        let todo = db.ensure_list(TODO_SLUG, "Sam", "test").unwrap();
+        assert_eq!((todo.slug.as_str(), todo.name.as_str()), ("todo", "To do"));
+        assert_eq!(db.ensure_list(TODO_SLUG, "Sam", "test").unwrap().id, todo.id, "made once");
+        db.create(new("Product ideas", "work"), "test").unwrap();
+        let ideas = db.find_or_list(IDEAS_SLUG, "Sam", "test").unwrap();
+        assert_eq!((ideas.slug.as_str(), ideas.name.as_str()), ("ideas", "Ideas"));
+        assert!(db.ensure_list("splats", "Sam", "test").is_err());
+        assert_eq!(db.find_or_list("ideas", "Sam", "test").unwrap().id, ideas.id);
+        assert_eq!(db.find_or_list("product", "Sam", "test").unwrap().slug, "product-ideas");
+        let p = db.create(new("Splats", "personal"), "test").unwrap();
+        db.add_task(p.id, "Viewer").unwrap();
+        let t = db.add_task(todo.id, "Trainer").unwrap();
+        let t = db.move_task(t.id, p.id).unwrap();
+        assert_eq!((t.project_id, t.position), (p.id, 2), "goes to the end");
+        assert!(db.tasks(todo.id).unwrap().is_empty());
+        assert_eq!(db.move_task(t.id, p.id).unwrap().position, 2, "moving to the same place is a no-op");
+        assert!(matches!(db.move_task(t.id, 9999), Err(Error::NotFound(_))));
+        assert_eq!(db.move_task(t.id, ideas.id).unwrap().project_id, ideas.id);
     }
 }
