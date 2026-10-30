@@ -354,8 +354,7 @@ function listPanel(l, list) {
         <li>
           <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
           <span class="t" title="Tap to expand">${rich(t.text)}</span>
-          ${moveButton(t)}
-          ${wontButton(t)}
+          <span class="acts">${moveButton(t)}${wontButton(t)}</span>
         </li>`).join('')}</ul>${more ? `<p class="hint" style="margin:0 0 10px"><a href="${all}">+ ${more} more</a></p>` : ''}` : `<p class="empty">${esc(l.empty)}</p>`}
       ${list.inProjects ? `<p class="hint" style="margin:0 0 10px"><a href="${l.slug === TODO_SLUG ? '#/todos' : '#/ideas'}">+ ${list.inProjects} in projects</a></p>` : ''}
       <form class="row" data-listadd><input placeholder="${esc(l.add)}" aria-label="${esc(l.add)}" style="flex:1;min-width:0"><button>Add</button></form>
@@ -525,10 +524,7 @@ async function renderProject(slug) {
     <li class="${t.done ? 'done' : ''}${t.wont_do ? ' wontdo' : ''}">
       <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
       <span class="t">${rich(t.text)}${wontLabel(t)}</span>
-      ${isList || closed(t) ? '' : kindButton(t)}
-      ${closed(t) ? '' : moveButton(t)}
-      ${t.done ? '' : wontButton(t)}
-      ${closed(t) ? `<button class="ghost x" data-deltask="${t.id}" aria-label="Delete for good" title="Delete for good">${trashIcon}</button>` : ''}
+      <span class="acts">${isList || closed(t) ? '' : kindButton(t)}${closed(t) ? '' : moveButton(t)}${t.done ? '' : wontButton(t)}${closed(t) ? `<button class="ghost x" data-deltask="${t.id}" aria-label="Delete for good" title="Delete for good">${trashIcon}</button>` : ''}</span>
     </li>`;
 
   app.innerHTML = `
@@ -588,8 +584,7 @@ async function renderProject(slug) {
               <li>
                 <input type="checkbox" data-task="${t.id}" aria-label="${esc(t.text)}">
                 <span class="t">${rich(t.text)}</span>
-                ${moveButton(t)}
-                ${wontButton(t)}
+                <span class="acts">${moveButton(t)}${wontButton(t)}</span>
               </li>`).join('')}</ul>`;
         }).join('')}` : ''}
       </section>`}
@@ -755,8 +750,7 @@ async function renderTodos(which = 'todos') {
           <li>
             <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
             <span class="t">${rich(t.text)}</span>
-            ${moveButton(t)}
-            ${wontButton(t)}
+            <span class="acts">${moveButton(t)}${wontButton(t)}</span>
           </li>`).join('')}</ul>
       </section>`).join('')}</div>` : `<div class="panel"><p class="empty">${ideas ? 'No ideas yet.' : 'Nothing to do anywhere. Nice.'}</p></div>`}`;
   const vb = app.querySelector('[data-vault]');
