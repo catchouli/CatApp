@@ -91,9 +91,10 @@ fn tools() -> Value {
         },
         {
             "name": "update_task",
-            "description": "Tick or untick a task or idea, change its text, turn it into an idea or back, or move it to another project (e.g. from 'todo' to a project, or to 'ideas'). Ids come from get_project.",
+            "description": "Tick or untick a task or idea, mark it won't do (decided against, kept on record) or put it back, change its text, turn it into an idea or back, or move it to another project (e.g. from 'todo' to a project, or to 'ideas'). Ids come from get_project.",
             "inputSchema": { "type": "object", "required": ["task_id"], "properties": {
                 "task_id": { "type": "integer" }, "done": { "type": "boolean" }, "text": { "type": "string" },
+                "wont_do": { "type": "boolean", "description": "true: decided not to do it (kept, not deleted); false puts it back" },
                 "idea": { "type": "boolean", "description": "true makes it an idea, false a task" },
                 "project": { "type": "string", "description": "Move it to the end of this project's list. It stays a task or idea, except that 'todo' makes it a task and 'ideas' an idea" }
             }}
@@ -139,7 +140,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("update_project", &["project", "name", "category", "status", "summary", "next_step", "links", "source"]),
     ("create_project", &["name", "category", "status", "summary", "next_step", "links"]),
     ("add_task", &["project", "text", "idea"]),
-    ("update_task", &["task_id", "done", "text", "idea", "project"]),
+    ("update_task", &["task_id", "done", "wont_do", "text", "idea", "project"]),
     ("recent_notes", &["limit", "category"]),
     ("search", &["query"]),
 ];
@@ -218,7 +219,12 @@ fn call(db: &Db, owner: &str, name: &str, a: &Value) -> Result<Value, String> {
                 db.move_task(id, p.id).map_err(e)?;
             }
             let kind = a.get("idea").and_then(Value::as_bool).map(|i| if i { "idea" } else { "task" }.to_string());
-            let patch = TaskPatch { text: owned(a, "text"), done: a.get("done").and_then(Value::as_bool), kind };
+            let patch = TaskPatch {
+                text: owned(a, "text"),
+                done: a.get("done").and_then(Value::as_bool),
+                kind,
+                wont_do: a.get("wont_do").and_then(Value::as_bool),
+            };
             v(&db.update_task(id, patch).map_err(e)?)
         }
         "recent_notes" => {

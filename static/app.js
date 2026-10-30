@@ -342,7 +342,7 @@ const LIST_SLUGS = LISTS.map(l => l.slug);
 
 function listPanel(l, list) {
   const items = list[l.items];
-  const allOpen = (pref.newestTasksFirst ? [...items].reverse() : items).filter(t => !t.done);
+  const allOpen = (pref.newestTasksFirst ? [...items].reverse() : items).filter(t => !closed(t));
   const done = items.length - allOpen.length;
   const open = allOpen.slice(0, l.shown);
   const more = allOpen.length - open.length;
@@ -355,6 +355,7 @@ function listPanel(l, list) {
           <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
           <span class="t" title="Tap to expand">${rich(t.text)}</span>
           ${moveButton(t)}
+          ${wontButton(t)}
         </li>`).join('')}</ul>${more ? `<p class="hint" style="margin:0 0 10px"><a href="${all}">+ ${more} more</a></p>` : ''}` : `<p class="empty">${esc(l.empty)}</p>`}
       ${list.inProjects ? `<p class="hint" style="margin:0 0 10px"><a href="${l.slug === TODO_SLUG ? '#/todos' : '#/ideas'}">+ ${list.inProjects} in projects</a></p>` : ''}
       <form class="row" data-listadd><input placeholder="${esc(l.add)}" aria-label="${esc(l.add)}" style="flex:1;min-width:0"><button>Add</button></form>
@@ -374,6 +375,7 @@ function wireList(l, list) {
     renderHome();
   }));
   wireMoves(panel, list[l.items], l.slug, renderHome);
+  wireWont(panel, renderHome);
   const form = panel.querySelector('[data-listadd]');
   form.onsubmit = e => {
     e.preventDefault();
@@ -396,6 +398,24 @@ const taskIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="t
 const kindButton = t => t.kind === 'idea'
   ? `<button class="ghost x" data-kind="task" data-id="${t.id}" aria-label="Make it a task" title="Make it a task">${taskIcon}</button>`
   : `<button class="ghost x" data-kind="idea" data-id="${t.id}" aria-label="Make it an idea" title="Not now: make it an idea">${ideaIcon}</button>`;
+// ✕ means "won't do": off the list but kept on record (under "Show done"); pressing it again puts it
+// back. Only done and won't-do items can be deleted outright.
+const closed = t => t.done || t.wont_do;
+const trashIcon = '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const wontButton = t => t.wont_do
+  ? `<button class="ghost x wont" data-wont="${t.id}" aria-pressed="true" aria-label="Put it back on the list" title="Won't do: press to put it back">✕</button>`
+  : `<button class="ghost x wont" data-wont="${t.id}" aria-pressed="false" aria-label="Won't do" title="Won't do (kept on record)">✕</button>`;
+const wontLabel = t => t.wont_do ? ' <span class="hint wont-label">won\'t do</span>' : '';
+
+function wireWont(root, after) {
+  root.querySelectorAll('[data-wont]').forEach(b => b.onclick = () => guard(async () => {
+    const wont = b.getAttribute('aria-pressed') !== 'true';
+    await api('PATCH', `/api/tasks/${b.dataset.wont}`, { wont_do: wont });
+    toast(wont ? 'Won\'t do (kept under done)' : 'Back on the list');
+    after();
+  }));
+}
+
 const moveButton = t => `<button class="ghost x" data-move="${t.id}" aria-label="Move to another project" title="Move to another project">${moveIcon}</button>`;
 
 // `items`: the tasks and ideas the buttons are for. Ideas gathered from several projects say which they're on.
@@ -492,17 +512,23 @@ async function renderProject(slug) {
   // The built-in lists hold only tasks (to do) or only ideas; the ideas list also shows the ideas on projects.
   const isList = LIST_SLUGS.includes(p.slug);
   const elsewhere = p.slug === IDEAS_SLUG ? await api('GET', '/api/ideas') : [];
-  const ordered = items => (newestFirst ? [...items].reverse() : items).filter(t => showDone || !t.done);
-  const ideasDone = p.ideas.filter(t => t.done).length;
+  // Open items first; done and won't-do ones after them, when shown.
+  const ordered = items => {
+    const all = newestFirst ? [...items].reverse() : items;
+    return [...all.filter(t => !closed(t)), ...(showDone ? all.filter(closed) : [])];
+  };
+  const tasksDone = p.tasks.filter(closed).length;
+  const ideasDone = p.ideas.filter(closed).length;
   const orderButton = n => n > 1 ? `<button class="ghost" data-taskorder aria-pressed="${newestFirst}" title="Change the order">${newestFirst ? 'Newest first' : 'Oldest first'}</button>` : '';
   const doneButton = n => n ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${n})`}</button>` : '';
   const itemRow = t => `
-    <li class="${t.done ? 'done' : ''}">
+    <li class="${t.done ? 'done' : ''}${t.wont_do ? ' wontdo' : ''}">
       <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
-      <span class="t">${rich(t.text)}</span>
-      ${isList ? '' : kindButton(t)}
-      ${moveButton(t)}
-      <button class="ghost x" data-deltask="${t.id}" aria-label="Delete">✕</button>
+      <span class="t">${rich(t.text)}${wontLabel(t)}</span>
+      ${isList || closed(t) ? '' : kindButton(t)}
+      ${closed(t) ? '' : moveButton(t)}
+      ${t.done ? '' : wontButton(t)}
+      ${closed(t) ? `<button class="ghost x" data-deltask="${t.id}" aria-label="Delete for good" title="Delete for good">${trashIcon}</button>` : ''}
     </li>`;
 
   app.innerHTML = `
@@ -541,8 +567,8 @@ async function renderProject(slug) {
 
       ${p.slug === IDEAS_SLUG ? '' : `
       <section class="panel a-tasks">
-        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${orderButton(p.tasks_total)}${doneButton(p.tasks_done)}</span></h2>
-        ${!showDone && p.tasks_total && p.tasks_total === p.tasks_done ? `<p class="empty">All done.</p>` : ''}
+        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${orderButton(p.tasks_total)}${doneButton(tasksDone)}</span></h2>
+        ${!showDone && p.tasks.length && p.tasks.every(closed) ? `<p class="empty">All done.</p>` : ''}
         <ul class="tasks">${ordered(p.tasks).map(itemRow).join('')}</ul>
         <form class="row" data-add="tasks"><input placeholder="Add a task" aria-label="New task" style="flex:1;min-width:0"><button>Add</button></form>
       </section>`}
@@ -563,6 +589,7 @@ async function renderProject(slug) {
                 <input type="checkbox" data-task="${t.id}" aria-label="${esc(t.text)}">
                 <span class="t">${rich(t.text)}</span>
                 ${moveButton(t)}
+                ${wontButton(t)}
               </li>`).join('')}</ul>`;
         }).join('')}` : ''}
       </section>`}
@@ -667,6 +694,7 @@ async function renderProject(slug) {
     renderProject(p.slug);
   }));
   wireMoves(app, [...p.tasks, ...p.ideas, ...elsewhere], p.slug, () => renderProject(p.slug));
+  wireWont(app, () => renderProject(p.slug));
   app.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => guard(async () => {
     await api('PATCH', `/api/tasks/${b.dataset.id}`, { kind: b.dataset.kind });
     toast(b.dataset.kind === 'idea' ? 'Moved to ideas' : 'Moved to tasks');
@@ -728,6 +756,7 @@ async function renderTodos(which = 'todos') {
             <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
             <span class="t">${rich(t.text)}</span>
             ${moveButton(t)}
+            ${wontButton(t)}
           </li>`).join('')}</ul>
       </section>`).join('')}</div>` : `<div class="panel"><p class="empty">${ideas ? 'No ideas yet.' : 'Nothing to do anywhere. Nice.'}</p></div>`}`;
   const vb = app.querySelector('[data-vault]');
@@ -738,6 +767,7 @@ async function renderTodos(which = 'todos') {
     again();
   }));
   wireMoves(app, items, null, again);
+  wireWont(app, again);
 }
 
 // ---- new project ------------------------------------------------------------------
@@ -800,7 +830,7 @@ async function renderSearch(q) {
   const r = await api('GET', `/api/search?q=${encodeURIComponent(q)}`);
   const out = [];
   if (r.projects.length) out.push(`<h2>Projects</h2><div class="cards">${r.projects.map(card).join('')}</div>`);
-  if (r.tasks.length) out.push(`<h2>Tasks</h2><ul class="panel feed">${r.tasks.map(t => `<li>${t.done ? '✓ ' : ''}${t.kind === 'idea' ? '<span class="hint">idea</span> ' : ''}${rich(t.text)}</li>`).join('')}</ul>`);
+  if (r.tasks.length) out.push(`<h2>Tasks</h2><ul class="panel feed">${r.tasks.map(t => `<li>${t.done ? '✓ ' : ''}${t.wont_do ? '<span class="hint">won\'t do</span> ' : ''}${t.kind === 'idea' ? '<span class="hint">idea</span> ' : ''}${rich(t.text)}</li>`).join('')}</ul>`);
   if (r.notes.length) out.push(`<h2>Notes</h2><ul class="panel feed">${r.notes.map(n => `
     <li><div class="who"><a href="#/p/${encodeURIComponent(n.project_slug)}">${esc(n.project_name)}</a> · ${ago(n.created_at)}</div><div class="body">${rich(n.body)}</div></li>`).join('')}</ul>`);
   document.getElementById('sr').innerHTML = out.join('') || '<p class="empty" style="margin-top:16px">Nothing found.</p>';

@@ -113,6 +113,9 @@ pub struct Task {
     pub position: i64,
     pub created_at: String,
     pub done_at: Option<String>,
+    /// Decided against: kept for the record, but not open and not done.
+    pub wont_do: bool,
+    pub wont_do_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -178,6 +181,9 @@ pub struct TaskPatch {
     /// "task" or "idea": turns one into the other.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Decided against it (true), or put it back (false). Ticking it done clears this.
+    #[serde(default)]
+    pub wont_do: Option<bool>,
 }
 
 const PROJECT_SELECT: &str = "SELECT p.id, p.slug, p.name, p.category, p.status, p.summary, p.next_step, p.links,
@@ -185,15 +191,15 @@ const PROJECT_SELECT: &str = "SELECT p.id, p.slug, p.name, p.category, p.status,
     MAX(p.updated_at, COALESCE((SELECT MAX(n.created_at) FROM notes n WHERE n.project_id = p.id), '')),
     (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id AND n.kind = 'note'),
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task' AND t.done = 1),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task'),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'idea' AND t.done = 0),
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task' AND t.wont_do_at IS NULL),
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'idea' AND t.done = 0 AND t.wont_do_at IS NULL),
     p.private
     FROM projects p";
 
 const NOTE_SELECT: &str = "SELECT n.id, n.project_id, p.slug, p.name, p.category, n.kind, n.body, n.source,
     n.created_at, n.edited_at FROM notes n JOIN projects p ON p.id = n.project_id";
 
-const TASK_SELECT: &str = "SELECT id, project_id, kind, text, done, position, created_at, done_at FROM tasks";
+const TASK_SELECT: &str = "SELECT id, project_id, kind, text, done, position, created_at, done_at, wont_do_at FROM tasks";
 
 /// What a checklist item can be.
 pub const KINDS: &[&str] = &["task", "idea"];
@@ -244,6 +250,8 @@ fn task_row(r: &Row) -> rusqlite::Result<Task> {
         position: r.get(5)?,
         created_at: r.get(6)?,
         done_at: r.get(7)?,
+        wont_do: r.get::<_, Option<String>>(8)?.is_some(),
+        wont_do_at: r.get(8)?,
     })
 }
 
@@ -386,6 +394,14 @@ impl Db {
                 ALTER TABLE projects ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 PRAGMA user_version = 3;
+                COMMIT;",
+            )?;
+        }
+        if version < 4 {
+            conn.execute_batch(
+                "BEGIN;
+                ALTER TABLE tasks ADD COLUMN wont_do_at TEXT;
+                PRAGMA user_version = 4;
                 COMMIT;",
             )?;
         }
@@ -731,19 +747,20 @@ impl Db {
 
     fn open_items(&self, kind: &str, private: bool) -> Result<Vec<ProjectItem>> {
         let mut st = self.conn.prepare(
-            "SELECT t.id, t.project_id, t.kind, t.text, t.done, t.position, t.created_at, t.done_at, p.slug, p.name, p.status, p.private
+            "SELECT t.id, t.project_id, t.kind, t.text, t.done, t.position, t.created_at, t.done_at, t.wont_do_at,
+                p.slug, p.name, p.status, p.private
              FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE t.kind = ?1 AND t.done = 0 AND (?2 OR p.private = 0)
+             WHERE t.kind = ?1 AND t.done = 0 AND t.wont_do_at IS NULL AND (?2 OR p.private = 0)
              ORDER BY p.slug IN (?3, ?4) DESC, p.updated_at DESC, p.id, t.position, t.id",
         )?;
         let rows = st
             .query_map(params![kind, private, TODO_SLUG, IDEAS_SLUG], |r| {
                 Ok(ProjectItem {
                     item: task_row(r)?,
-                    project_slug: r.get(8)?,
-                    project_name: r.get(9)?,
-                    project_status: r.get(10)?,
-                    project_private: r.get::<_, i64>(11)? != 0,
+                    project_slug: r.get(9)?,
+                    project_name: r.get(10)?,
+                    project_status: r.get(11)?,
+                    project_private: r.get::<_, i64>(12)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -791,8 +808,14 @@ impl Db {
             Some(t) => non_empty(t, "a task")?,
             None => cur.text.clone(),
         };
-        let done = patch.done.unwrap_or(cur.done);
+        // Done and won't-do rule each other out: setting one clears the other.
+        if patch.done == Some(true) && patch.wont_do == Some(true) {
+            return Err(Error::Invalid("it can't be both done and won't do".into()));
+        }
+        let wont_do = if patch.done == Some(true) { false } else { patch.wont_do.unwrap_or(cur.wont_do) };
+        let done = if wont_do { false } else { patch.done.unwrap_or(cur.done) };
         let done_at = if done { cur.done_at.clone().or_else(|| Some(now())) } else { None };
+        let wont_do_at = if wont_do { cur.wont_do_at.clone().or_else(|| Some(now())) } else { None };
         let kind = match &patch.kind {
             Some(k) => check_kind(k)?,
             None => cur.kind.clone(),
@@ -804,8 +827,8 @@ impl Db {
             }
         }
         self.conn.execute(
-            "UPDATE tasks SET text = ?1, done = ?2, done_at = ?3, kind = ?4 WHERE id = ?5",
-            params![text, done as i64, done_at, kind, id],
+            "UPDATE tasks SET text = ?1, done = ?2, done_at = ?3, kind = ?4, wont_do_at = ?5 WHERE id = ?6",
+            params![text, done as i64, done_at, kind, wont_do_at, id],
         )?;
         self.touch(cur.project_id)?;
         self.task(id)
@@ -906,11 +929,15 @@ impl Db {
                 let (ideas, tasks): (Vec<_>, Vec<_>) = items.iter().partition(|t| t.kind == "idea" && p.slug != IDEAS_SLUG);
                 if !tasks.is_empty() {
                     for t in &tasks {
-                        out.push_str(&format!("- [{}] {}\n", if t.done { "x" } else { " " }, t.text));
+                        if t.wont_do {
+                            out.push_str(&format!("- [-] {} (won't do)\n", t.text));
+                        } else {
+                            out.push_str(&format!("- [{}] {}\n", if t.done { "x" } else { " " }, t.text));
+                        }
                     }
                     out.push('\n');
                 }
-                let ideas: Vec<_> = ideas.iter().filter(|t| !t.done).collect();
+                let ideas: Vec<_> = ideas.iter().filter(|t| !t.done && !t.wont_do).collect();
                 if !ideas.is_empty() {
                     out.push_str("Ideas:\n");
                     for t in ideas {
@@ -1039,6 +1066,32 @@ mod tests {
         assert_eq!(db.move_task(t.id, p.id).unwrap().position, 2, "moving to the same place is a no-op");
         assert!(matches!(db.move_task(t.id, 9999), Err(Error::NotFound(_))));
         assert_eq!(db.move_task(t.id, ideas.id).unwrap().project_id, ideas.id);
+    }
+
+    #[test]
+    fn wont_do() {
+        let db = Db::memory().unwrap();
+        let p = db.create(new("Learn Blender", "personal"), "test").unwrap();
+        let t = db.add_task(p.id, "Model the mug").unwrap();
+        db.add_task(p.id, "Texture the mug").unwrap();
+        let i = db.add_idea(p.id, "Animate the mug").unwrap();
+        let wont = |v| TaskPatch { wont_do: Some(v), ..Default::default() };
+        let t = db.update_task(t.id, wont(true)).unwrap();
+        assert!(t.wont_do && t.wont_do_at.is_some() && !t.done);
+        db.update_task(i.id, wont(true)).unwrap();
+        let p2 = db.project_by_id(p.id).unwrap();
+        assert_eq!((p2.tasks_done, p2.tasks_total, p2.ideas_open), (0, 1, 0), "won't-do items aren't open or counted");
+        assert_eq!(db.open_items_everywhere("task").unwrap().len(), 1);
+        assert!(db.project_ideas().unwrap().is_empty());
+        assert!(db.export_markdown(3, "CatApp").unwrap().contains("- [-] Model the mug (won't do)"));
+        // Ticking it done clears won't-do; marking won't-do unticks it; false puts it back.
+        let t = db.update_task(t.id, TaskPatch { done: Some(true), ..Default::default() }).unwrap();
+        assert!(t.done && !t.wont_do);
+        let t = db.update_task(t.id, wont(true)).unwrap();
+        assert!(!t.done && t.wont_do && t.done_at.is_none());
+        let t = db.update_task(t.id, wont(false)).unwrap();
+        assert!(!t.done && !t.wont_do && t.wont_do_at.is_none());
+        assert!(db.update_task(t.id, TaskPatch { done: Some(true), wont_do: Some(true), ..Default::default() }).is_err());
     }
 
     #[test]

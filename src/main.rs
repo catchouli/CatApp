@@ -167,8 +167,10 @@ enum TaskCmd {
     Add { project: String, text: Vec<String> },
     /// Mark a task done
     Done { id: i64 },
-    /// Mark a task not done
+    /// Put a task back on the list (not done, and not won't do)
     Undo { id: i64 },
+    /// Decide not to do a task or idea: it's kept on record, off the list (`undo` puts it back)
+    Wontdo { id: i64 },
     /// Move a task or idea to another project (or `todo`, `ideas`)
     Mv { id: i64, project: String },
     /// Turn a task into an idea
@@ -327,12 +329,23 @@ fn project_ideas_cmd(project: &str, text: Vec<String>, all: bool) -> Result<(), 
 }
 
 fn print_items(items: &[db::Task], all: bool, empty: &str) {
-    let shown: Vec<_> = items.iter().filter(|t| all || !t.done).collect();
+    let shown: Vec<_> = items.iter().filter(|t| all || !(t.done || t.wont_do)).collect();
     if shown.is_empty() {
         println!("{empty}");
     }
     for t in shown {
-        println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
+        println!("  [{}] {}  (#{})", mark(t), t.text, t.id);
+    }
+}
+
+/// x for done, - for won't do.
+fn mark(t: &db::Task) -> &'static str {
+    if t.done {
+        "x"
+    } else if t.wont_do {
+        "-"
+    } else {
+        " "
     }
 }
 
@@ -438,10 +451,10 @@ fn run(cli: Cli) -> Result<(), String> {
             if !d.tasks.is_empty() {
                 println!("\nTasks ({}/{}):", p.tasks_done, p.tasks_total);
                 for t in &d.tasks {
-                    println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
+                    println!("  [{}] {}  (#{})", mark(t), t.text, t.id);
                 }
             }
-            let ideas: Vec<_> = d.ideas.iter().filter(|t| !t.done).collect();
+            let ideas: Vec<_> = d.ideas.iter().filter(|t| !t.done && !t.wont_do).collect();
             if !ideas.is_empty() {
                 println!("\nIdeas:");
                 for t in ideas {
@@ -487,10 +500,14 @@ fn run(cli: Cli) -> Result<(), String> {
                     let t = db.add_task(p.id, &text_or_stdin(text)?).map_err(e)?;
                     println!("Added task #{} to {}", t.id, p.name);
                 }
-                TaskCmd::Done { id } | TaskCmd::Undo { id } => {
-                    let done = matches!(cmd, TaskCmd::Done { .. });
-                    let t = db.update_task(id, TaskPatch { done: Some(done), ..Default::default() }).map_err(e)?;
-                    println!("[{}] {}", if t.done { "x" } else { " " }, t.text);
+                TaskCmd::Done { id } | TaskCmd::Undo { id } | TaskCmd::Wontdo { id } => {
+                    let patch = match cmd {
+                        TaskCmd::Done { .. } => TaskPatch { done: Some(true), ..Default::default() },
+                        TaskCmd::Wontdo { .. } => TaskPatch { wont_do: Some(true), ..Default::default() },
+                        _ => TaskPatch { done: Some(false), wont_do: Some(false), ..Default::default() },
+                    };
+                    let t = db.update_task(id, patch).map_err(e)?;
+                    println!("[{}] {}", mark(&t), t.text);
                 }
                 TaskCmd::ToIdea { id } | TaskCmd::ToTask { id } => {
                     let kind = if matches!(cmd, TaskCmd::ToIdea { .. }) { "idea" } else { "task" };

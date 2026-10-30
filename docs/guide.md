@@ -53,10 +53,13 @@ catapp idea learn to juggle  # add an idea (`catapp idea` lists them, and the pr
 catapp idea -p blender try geometry nodes  # add an idea to a project (`-p blender` alone lists them)
 catapp task to-idea 76       # turn a task into an idea (`to-task` turns one back)
 catapp task done 76          # tick one off
+catapp task wontdo 76        # decided against it: kept on record, off the list (`task undo 76` puts it back)
 catapp task mv 76 blender    # move it to a project (or to todo, ideas)
 ```
 
 To move a task in the app, press the arrow next to it (on a project page or in the home-page lists; on desktop it shows when you hover) and pick where it goes. Type to filter; finished projects only show up when you search for them.
+
+The ✕ next to a task or idea means **won't do**: it leaves the list but is kept, struck through, under "Show done" (with the date). Press ✕ again to put it back, or tick it if you did it after all. Only done and won't-do items can be deleted for good (the bin icon), so nothing disappears by accident.
 
 To see everything at once, follow "+ N in projects" under either list (or go to `#/todos`): every open task, the to-do list first and then a panel per project, across the full width. The Ideas tab does the same for ideas.
 

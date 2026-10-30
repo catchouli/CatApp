@@ -222,6 +222,9 @@ dialog#move[open] { display: flex; flex-direction: column; }
 .tasks input[type=checkbox] { width: 20px; height: 20px; margin: 2px 0 0; flex: none; accent-color: var(--accent); }
 .tasks .t { flex: 1; overflow-wrap: anywhere; }
 .tasks li.done .t { color: var(--faint); text-decoration: line-through; }
+.tasks li.wontdo .t { color: var(--faint); text-decoration: line-through; }
+.tasks .wont-label { text-decoration: none; display: inline-block; margin-left: 4px; }
+.tasks .wont[aria-pressed="true"] { opacity: 1; color: var(--danger); }
 .tasks .x { opacity: 0; }
 .tasks li:hover .x, .tasks li:focus-within .x { opacity: 1; }
 @media (hover: none) { .tasks .x { opacity: 1; } }
