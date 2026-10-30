@@ -99,6 +99,114 @@ function submitOnCmdEnter(textarea, fn) {
   });
 }
 
+// ---- private projects -------------------------------------------------------------
+// Their text is encrypted here in the browser, with a key made from a passphrase that never leaves
+// it; the server only ever stores "enc1:..." and hides them from agents. The key lives in memory only,
+// so a reload locks them again.
+
+const vault = { key: null };
+const CHECK = 'private projects';
+const canEncrypt = () => !!(window.crypto && crypto.subtle);
+
+function b64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+async function deriveKey(pass, salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 600000, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+
+// Empty stays empty, so "no next step" still reads as none.
+async function seal(text, key = vault.key) {
+  if (!String(text ?? '').trim()) return '';
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text)));
+  return `enc1:${b64(iv)}.${b64(ct)}`;
+}
+
+async function unseal(s, key = vault.key) {
+  if (!s || !s.startsWith('enc1:')) return s;
+  const [iv, ct] = s.slice(5).split('.').map(unb64);
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
+}
+
+async function unsealOr(s) {
+  try { return await unseal(s); } catch { return '🔒 (can\'t decrypt)'; }
+}
+
+// Decrypts a project (and whatever of its log, tasks and ideas came with it) in place.
+async function unsealProject(p) {
+  if (!p.private || !vault.key) return p;
+  for (const k of ['name', 'summary', 'next_step', 'links']) p[k] = await unsealOr(p[k]);
+  for (const n of p.notes || []) if (n.kind !== 'status') n.body = await unsealOr(n.body);
+  for (const t of [...(p.tasks || []), ...(p.ideas || [])]) t.text = await unsealOr(t.text);
+  return p;
+}
+
+// Asks for the passphrase (or sets one, the first time). Resolves true once unlocked.
+async function unlock() {
+  if (vault.key) return true;
+  if (!canEncrypt()) {
+    toast('Private projects need the app on this computer (localhost) or over HTTPS', true);
+    return false;
+  }
+  const v = await guard(() => api('GET', '/api/private'));
+  if (v === undefined) return false;
+  const first = !v;
+  const dlg = document.getElementById('move');
+  dlg.innerHTML = `
+    <form method="dialog" class="move unlock">
+      <header><strong>${first ? 'Set a passphrase' : 'Unlock private projects'}</strong><button class="ghost" value="cancel" formnovalidate aria-label="Close">✕</button></header>
+      ${first ? `<p class="hint">Private projects are encrypted with this before they're saved, and agents can't see them. It can't be changed or recovered: if you forget it, they're gone.</p>` : ''}
+      <input type="password" name="p1" placeholder="Passphrase" aria-label="Passphrase" autocomplete="${first ? 'new-password' : 'current-password'}" required>
+      ${first ? '<input type="password" name="p2" placeholder="Again" aria-label="Passphrase again" autocomplete="new-password" required>' : ''}
+      <p class="hint err" hidden></p>
+      <div class="row end"><button class="primary" value="ok">${first ? 'Set passphrase' : 'Unlock'}</button></div>
+    </form>`;
+  const form = dlg.querySelector('form'), err = dlg.querySelector('.err');
+  const fail = msg => { err.textContent = msg; err.hidden = false; };
+  return new Promise(resolve => {
+    dlg.onclose = () => resolve(!!vault.key);
+    dlg.onclick = e => { if (e.target === dlg) dlg.close(); };
+    form.onsubmit = async e => {
+      if (e.submitter && e.submitter.value === 'cancel') return;
+      e.preventDefault();
+      const p1 = form.p1.value;
+      try {
+        if (first) {
+          if (p1.length < 8) return fail('Use at least 8 characters.');
+          if (p1 !== form.p2.value) return fail('They don\'t match.');
+          const salt = crypto.getRandomValues(new Uint8Array(16));
+          const key = await deriveKey(p1, salt);
+          await api('PUT', '/api/private', { salt: b64(salt), check: await seal(CHECK, key) });
+          vault.key = key;
+        } else {
+          err.hidden = false; err.textContent = 'Unlocking…';
+          const key = await deriveKey(p1, unb64(v.salt));
+          if (await unseal(v.check, key).catch(() => null) !== CHECK) return fail('That\'s not it.');
+          vault.key = key;
+        }
+        dlg.close();
+      } catch (x) { fail(x.message); }
+    };
+    dlg.showModal();
+    form.p1.focus();
+  });
+}
+
+function lock() {
+  vault.key = null;
+  toast('Locked');
+  render();
+}
+
+const lockIcon = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M6 11h12v9H6zM8.5 11V8a3.5 3.5 0 0 1 7 0v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
+
 // ---- routing ----------------------------------------------------------------------
 
 async function render() {
@@ -107,6 +215,7 @@ async function render() {
     if (!meta.statuses.length) meta = await api('GET', '/api/meta');
     if (h.startsWith('/p/')) await renderProject(decodeURIComponent(h.slice(3)));
     else if (h === '/new') renderNew();
+    else if (h === '/todos' || h === '/ideas') await renderTodos(h.slice(1));
     else if (h.startsWith('/search')) await renderSearch(decodeURIComponent(h.split('q=')[1] || ''));
     else if (h === '/ask') { history.replaceState(null, '', '#/'); await renderHome(); openAsk(); }
     else await renderHome();
@@ -134,8 +243,13 @@ async function renderHome() {
   // The built-in lists (to-do, ideas) are projects shown as panels, not cards. Adding to one
   // that doesn't exist yet makes it.
   const lists = await Promise.all(LISTS.map(l => allProjects.some(p => p.slug === l.slug)
-    ? api('GET', `/api/projects/${l.slug}`) : { slug: l.slug, tasks: [] }));
-  const projects = allProjects.filter(p => !LIST_SLUGS.includes(p.slug));
+    ? api('GET', `/api/projects/${l.slug}`) : { slug: l.slug, tasks: [], ideas: [] }));
+  const projects = allProjects.filter(p => !LIST_SLUGS.includes(p.slug) && !p.private);
+  const privates = allProjects.filter(p => p.private && (pref.showFinished || !FINISHED.includes(p.status)));
+  for (const p of privates) await unsealProject(p);
+  lists[LIST_SLUGS.indexOf(IDEAS_SLUG)].inProjects = projects.reduce((n, p) => n + p.ideas_open, 0);
+  lists[LIST_SLUGS.indexOf(TODO_SLUG)].inProjects = allProjects.filter(p => !LIST_SLUGS.includes(p.slug))
+    .reduce((n, p) => n + p.tasks_total - p.tasks_done, 0);
   const filter = pref.filter || 'all';
   const showFinished = !!pref.showFinished;
   const cats = catOrder([...new Set(projects.map(p => p.category))]);
@@ -162,6 +276,12 @@ async function renderHome() {
           <button class="chip" data-finished aria-pressed="${showFinished}">${showFinished ? 'Hide' : 'Show'} finished${finishedCount ? ` (${finishedCount})` : ''}</button>
         </div>
         ${groups || `<div class="panel"><p class="empty">No projects here yet.</p><a class="btn primary" href="#/new">New project</a></div>`}
+        ${privates.length ? `
+        <section class="group">
+          <h2 class="section-title private-title">${lockIcon} Private <button class="ghost" data-vault>${vault.key ? 'Lock' : 'Unlock'}</button></h2>
+          ${vault.key ? `<div class="cards">${privates.sort((a, b) => b.last_activity.localeCompare(a.last_activity)).map(card).join('')}</div>`
+            : `<p class="hint">${privates.length} private project${privates.length === 1 ? '' : 's'}, locked.</p>`}
+        </section>` : ''}
       </div>
       <aside>
         ${LISTS.map((l, i) => listPanel(l, lists[i])).join('')}
@@ -187,6 +307,8 @@ async function renderHome() {
 
   app.querySelectorAll('[data-filter]').forEach(b => b.onclick = () => { pref.filter = b.dataset.filter; savePref(); renderHome(); });
   app.querySelector('[data-finished]').onclick = () => { pref.showFinished = !showFinished; savePref(); renderHome(); };
+  const vb = app.querySelector('[data-vault]');
+  if (vb) vb.onclick = async () => { if (vault.key) lock(); else if (await unlock()) renderHome(); };
 
   const qs = document.getElementById('qs');
   if (qs) {
@@ -210,16 +332,18 @@ async function renderHome() {
 
 // ---- to-do and ideas lists ---------------------------------------------------------
 
-const TODO_SLUG = 'todo';
+const TODO_SLUG = 'todo', IDEAS_SLUG = 'ideas';
+// `items`: which of the list's items it shows (everything on the ideas list is an idea).
 const LISTS = [
-  { slug: TODO_SLUG, title: 'To do', shown: 8, add: 'Add a to-do', empty: 'Nothing to do. Nice.' },
-  { slug: 'ideas', title: 'Ideas', shown: 5, add: 'Add an idea', empty: 'Nothing yet. Jot ideas down here so they don\'t get lost.' },
+  { slug: TODO_SLUG, items: 'tasks', title: 'To do', shown: 8, add: 'Add a to-do', empty: 'Nothing to do. Nice.' },
+  { slug: IDEAS_SLUG, items: 'ideas', title: 'Ideas', shown: 5, add: 'Add an idea', empty: 'Nothing yet. Jot ideas down here so they don\'t get lost.' },
 ];
 const LIST_SLUGS = LISTS.map(l => l.slug);
 
 function listPanel(l, list) {
-  const allOpen = (pref.newestTasksFirst ? [...list.tasks].reverse() : list.tasks).filter(t => !t.done);
-  const done = list.tasks.length - allOpen.length;
+  const items = list[l.items];
+  const allOpen = (pref.newestTasksFirst ? [...items].reverse() : items).filter(t => !closed(t));
+  const done = items.length - allOpen.length;
   const open = allOpen.slice(0, l.shown);
   const more = allOpen.length - open.length;
   const all = `#/p/${l.slug}`;
@@ -230,8 +354,9 @@ function listPanel(l, list) {
         <li>
           <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
           <span class="t" title="Tap to expand">${rich(t.text)}</span>
-          ${moveButton(t)}
+          <span class="acts">${moveButton(t)}${wontButton(t)}</span>
         </li>`).join('')}</ul>${more ? `<p class="hint" style="margin:0 0 10px"><a href="${all}">+ ${more} more</a></p>` : ''}` : `<p class="empty">${esc(l.empty)}</p>`}
+      ${list.inProjects ? `<p class="hint" style="margin:0 0 10px"><a href="${l.slug === TODO_SLUG ? '#/todos' : '#/ideas'}">+ ${list.inProjects} in projects</a></p>` : ''}
       <form class="row" data-listadd><input placeholder="${esc(l.add)}" aria-label="${esc(l.add)}" style="flex:1;min-width:0"><button>Add</button></form>
     </div>`;
 }
@@ -248,7 +373,8 @@ function wireList(l, list) {
     toast('Done ✓');
     renderHome();
   }));
-  wireMoves(panel, list, renderHome);
+  wireMoves(panel, list[l.items], l.slug, renderHome);
+  wireWont(panel, renderHome);
   const form = panel.querySelector('[data-listadd]');
   form.onsubmit = e => {
     e.preventDefault();
@@ -265,12 +391,37 @@ function wireList(l, list) {
 // ---- moving a task to another project or list ------------------------------------------
 
 const moveIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12h13M12 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ideaIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const taskIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M5 4h14v16H5zM9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+// Turns a task into an idea on the same project, or back.
+const kindButton = t => t.kind === 'idea'
+  ? `<button class="ghost x" data-kind="task" data-id="${t.id}" aria-label="Make it a task" title="Make it a task">${taskIcon}</button>`
+  : `<button class="ghost x" data-kind="idea" data-id="${t.id}" aria-label="Make it an idea" title="Not now: make it an idea">${ideaIcon}</button>`;
+// ✕ means "won't do": off the list but kept on record (under "Show done"); pressing it again puts it
+// back. Only done and won't-do items can be deleted outright.
+const closed = t => t.done || t.wont_do;
+const trashIcon = '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const wontButton = t => t.wont_do
+  ? `<button class="ghost x wont" data-wont="${t.id}" aria-pressed="true" aria-label="Put it back on the list" title="Won't do: press to put it back">✕</button>`
+  : `<button class="ghost x wont" data-wont="${t.id}" aria-pressed="false" aria-label="Won't do" title="Won't do (kept on record)">✕</button>`;
+const wontLabel = t => t.wont_do ? ' <span class="hint wont-label">won\'t do</span>' : '';
+
+function wireWont(root, after) {
+  root.querySelectorAll('[data-wont]').forEach(b => b.onclick = () => guard(async () => {
+    const wont = b.getAttribute('aria-pressed') !== 'true';
+    await api('PATCH', `/api/tasks/${b.dataset.wont}`, { wont_do: wont });
+    toast(wont ? 'Won\'t do (kept under done)' : 'Back on the list');
+    after();
+  }));
+}
+
 const moveButton = t => `<button class="ghost x" data-move="${t.id}" aria-label="Move to another project" title="Move to another project">${moveIcon}</button>`;
 
-function wireMoves(root, project, after) {
+// `items`: the tasks and ideas the buttons are for. Ideas gathered from several projects say which they're on.
+function wireMoves(root, items, from, after) {
   root.querySelectorAll('[data-move]').forEach(b => b.onclick = () => {
-    const t = project.tasks.find(x => String(x.id) === b.dataset.move);
-    if (t) openMove(t, project.slug, after);
+    const t = items.find(x => String(x.id) === b.dataset.move);
+    if (t) openMove(t, t.project_slug || from, after);
   });
 }
 
@@ -279,9 +430,12 @@ function wireMoves(root, project, after) {
 async function openMove(task, from, after) {
   const projects = await guard(() => api('GET', '/api/projects'));
   if (!projects) return;
+  // Private things only move between private projects.
+  const priv = !!projects.find(p => p.slug === from)?.private;
+  for (const p of projects) if (p.private) await unsealProject(p);
   const targets = [
-    ...LISTS.filter(l => l.slug !== from).map(l => ({ slug: l.slug, name: l.title, list: true })),
-    ...projects.filter(p => !LIST_SLUGS.includes(p.slug) && p.slug !== from)
+    ...(priv ? [] : LISTS.filter(l => l.slug !== from).map(l => ({ slug: l.slug, name: l.title, list: true }))),
+    ...projects.filter(p => !LIST_SLUGS.includes(p.slug) && p.slug !== from && p.private === priv && (!p.private || vault.key))
       .sort((a, b) => b.last_activity.localeCompare(a.last_activity))
       .map(p => ({ slug: p.slug, name: p.name, status: p.status, finished: FINISHED.includes(p.status) })),
   ];
@@ -325,6 +479,7 @@ function card(p) {
       ${p.next_step ? `<div class="next">Next: ${esc(p.next_step)}</div>` : ''}
       <div class="meta">
         ${p.tasks_total ? `<span class="bar" aria-hidden="true"><i style="width:${pct}%"></i></span><span>${p.tasks_done}/${p.tasks_total} tasks</span>` : ''}
+        ${p.ideas_open ? `<span>${p.ideas_open} idea${p.ideas_open === 1 ? '' : 's'}</span>` : ''}
         ${p.note_count ? `<span>${p.note_count} note${p.note_count === 1 ? '' : 's'}</span>` : ''}
         <span title="${esc(fullTime(p.last_activity))}">${ago(p.last_activity)}</span>
       </div>
@@ -336,6 +491,16 @@ function card(p) {
 async function renderProject(slug) {
   const p = await api('GET', `/api/projects/${encodeURIComponent(slug)}`);
   const base = `/api/projects/${encodeURIComponent(p.slug)}`;
+  if (p.private && !vault.key) {
+    app.innerHTML = `
+      <a class="back" href="#/">← All projects</a>
+      <div class="panel locked"><p>${lockIcon} This project is private.</p><button class="primary" data-vault>Unlock</button></div>`;
+    app.querySelector('[data-vault]').onclick = async () => { if (await unlock()) renderProject(slug); };
+    return;
+  }
+  await unsealProject(p);
+  // Everything typed into a private project is encrypted before it's sent.
+  const out = text => p.private ? seal(text) : text;
   const linkLines = p.links.split('\n').map(l => l.trim()).filter(Boolean);
   const logFilter = pref.logFilter || 'all';
   const showDone = !!pref.showDoneTasks;
@@ -343,18 +508,37 @@ async function renderProject(slug) {
   const pick = { all: () => true, mine: n => !isAgent(n) && n.kind === 'note', agents: isAgent };
   const counts = { mine: p.notes.filter(pick.mine).length, agents: p.notes.filter(pick.agents).length };
   const notes = p.notes.filter(pick[logFilter] || pick.all);
+  // The built-in lists hold only tasks (to do) or only ideas; the ideas list also shows the ideas on projects.
+  const isList = LIST_SLUGS.includes(p.slug);
+  const elsewhere = p.slug === IDEAS_SLUG ? await api('GET', '/api/ideas') : [];
+  // Open items first; done and won't-do ones after them, when shown.
+  const ordered = items => {
+    const all = newestFirst ? [...items].reverse() : items;
+    return [...all.filter(t => !closed(t)), ...(showDone ? all.filter(closed) : [])];
+  };
+  const tasksDone = p.tasks.filter(closed).length;
+  const ideasDone = p.ideas.filter(closed).length;
+  const orderButton = n => n > 1 ? `<button class="ghost" data-taskorder aria-pressed="${newestFirst}" title="Change the order">${newestFirst ? 'Newest first' : 'Oldest first'}</button>` : '';
+  const doneButton = n => n ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${n})`}</button>` : '';
+  const itemRow = t => `
+    <li class="${t.done ? 'done' : ''}${t.wont_do ? ' wontdo' : ''}">
+      <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
+      <span class="t">${rich(t.text)}${wontLabel(t)}</span>
+      <span class="acts">${isList || closed(t) ? '' : kindButton(t)}${closed(t) ? '' : moveButton(t)}${t.done ? '' : wontButton(t)}${closed(t) ? `<button class="ghost x" data-deltask="${t.id}" aria-label="Delete for good" title="Delete for good">${trashIcon}</button>` : ''}</span>
+    </li>`;
 
   app.innerHTML = `
     <a class="back" href="#/">← All projects</a>
     <div class="proj-head">
       <div>
-        <h1>${esc(p.name)}</h1>
+        <h1>${p.private ? `<span class="private-mark" title="Private: encrypted, and hidden from agents">${lockIcon}</span> ` : ''}${esc(p.name)}</h1>
         <div class="sub">${esc(cap(p.category))} · started ${esc(new Date(p.created_at).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }))}</div>
       </div>
       <label style="margin:0">
         <span class="hint" style="display:block;margin-bottom:4px">Status</span>
         <select id="status">${meta.statuses.map(s => `<option ${s === p.status ? 'selected' : ''}>${s}</option>`).join('')}</select>
       </label>
+      ${p.private ? '<button class="ghost" data-lock style="align-self:flex-end">Lock</button>' : ''}
     </div>
 
     <div class="project">
@@ -373,22 +557,37 @@ async function renderProject(slug) {
               <span title="${esc(fullTime(n.created_at))}">${esc(fullTime(n.created_at))}</span>${srcBadge(n.source)}${n.edited_at ? '<span class="hint">edited</span>' : ''}
               <span class="actions">${n.kind === 'note' ? '<button class="ghost" data-act="edit">Edit</button>' : ''}<button class="ghost" data-act="del">Delete</button></span>
             </div>
-            <div class="body">${rich(n.body)}</div>
+            <div class="body">${p.private && n.kind === 'next' ? 'Next step: ' : ''}${rich(n.body)}</div>
           </li>`).join('') || ''}</ul>
       </section>
 
+      ${p.slug === IDEAS_SLUG ? '' : `
       <section class="panel a-tasks">
-        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${p.tasks_total > 1 ? `<button class="ghost" data-taskorder aria-pressed="${newestFirst}" title="Change task order">${newestFirst ? 'Newest first' : 'Oldest first'}</button>` : ''}${p.tasks_done ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${p.tasks_done})`}</button>` : ''}</span></h2>
-        ${!showDone && p.tasks_total && p.tasks_total === p.tasks_done ? `<p class="empty">All done.</p>` : ''}
-        <ul class="tasks">${(newestFirst ? [...p.tasks].reverse() : p.tasks).filter(t => showDone || !t.done).map(t => `
-          <li class="${t.done ? 'done' : ''}">
-            <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
-            <span class="t">${rich(t.text)}</span>
-            ${moveButton(t)}
-            <button class="ghost x" data-deltask="${t.id}" aria-label="Delete task">✕</button>
-          </li>`).join('')}</ul>
-        <form id="task-form" class="row"><input id="task" placeholder="Add a task" aria-label="New task" style="flex:1;min-width:0"><button>Add</button></form>
-      </section>
+        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${orderButton(p.tasks_total)}${doneButton(tasksDone)}</span></h2>
+        ${!showDone && p.tasks.length && p.tasks.every(closed) ? `<p class="empty">All done.</p>` : ''}
+        <ul class="tasks">${ordered(p.tasks).map(itemRow).join('')}</ul>
+        <form class="row" data-add="tasks"><input placeholder="Add a task" aria-label="New task" style="flex:1;min-width:0"><button>Add</button></form>
+      </section>`}
+
+      ${p.slug === TODO_SLUG ? '' : `
+      <section class="panel a-ideas">
+        <h2><span>Ideas ${p.ideas_open ? `<span class="hint">${p.ideas_open}</span>` : ''}</span><span>${p.slug === IDEAS_SLUG ? orderButton(p.ideas.length) : ''}${doneButton(ideasDone)}</span></h2>
+        ${p.ideas_open || showDone && ideasDone ? '' : `<p class="empty">${isList ? 'No general ideas yet.' : 'Things to maybe do some day.'}</p>`}
+        <ul class="tasks">${ordered(p.ideas).map(itemRow).join('')}</ul>
+        <form class="row" data-add="ideas"><input placeholder="Add an idea" aria-label="New idea" style="flex:1;min-width:0"><button>Add</button></form>
+        ${elsewhere.length ? `
+        <h3 class="sub-title">In projects</h3>
+        ${[...new Set(elsewhere.map(i => i.project_slug))].map(slug => {
+          const group = elsewhere.filter(i => i.project_slug === slug);
+          return `<p class="idea-project"><a href="#/p/${encodeURIComponent(slug)}">${esc(group[0].project_name)}</a></p>
+            <ul class="tasks">${group.map(t => `
+              <li>
+                <input type="checkbox" data-task="${t.id}" aria-label="${esc(t.text)}">
+                <span class="t">${rich(t.text)}</span>
+                <span class="acts">${moveButton(t)}${wontButton(t)}</span>
+              </li>`).join('')}</ul>`;
+        }).join('')}` : ''}
+      </section>`}
 
       <section class="panel a-details">
         <h2>Details <button class="ghost" data-edit="details">Edit</button></h2>
@@ -398,6 +597,9 @@ async function renderProject(slug) {
         </div>
       </section>
     </div>`;
+
+  const lb = app.querySelector('[data-lock]');
+  if (lb) lb.onclick = lock;
 
   // Status
   document.getElementById('status').onchange = e => guard(async () => {
@@ -413,7 +615,7 @@ async function renderProject(slug) {
       <div class="row end" style="margin-top:8px"><button class="ghost" id="next-cancel">Cancel</button><button class="primary" id="next-save">Save</button></div>`;
     const ta = document.getElementById('next-in');
     ta.focus();
-    const save = () => guard(async () => { await api('PATCH', base, { next_step: ta.value }); toast('Next step saved'); renderProject(p.slug); });
+    const save = () => guard(async () => { await api('PATCH', base, { next_step: await out(ta.value) }); toast('Next step saved'); renderProject(p.slug); });
     document.getElementById('next-save').onclick = save;
     document.getElementById('next-cancel').onclick = () => { ta.value = ''; renderProject(p.slug); };
     submitOnCmdEnter(ta, save);
@@ -431,10 +633,10 @@ async function renderProject(slug) {
     document.getElementById('d-cancel').onclick = () => { v.querySelectorAll('textarea').forEach(t => t.value = ''); renderProject(p.slug); };
     document.getElementById('d-save').onclick = () => guard(async () => {
       await api('PATCH', base, {
-        name: document.getElementById('d-name').value,
+        name: await out(document.getElementById('d-name').value),
         category: document.getElementById('d-cat').value,
-        summary: document.getElementById('d-sum').value,
-        links: document.getElementById('d-links').value,
+        summary: await out(document.getElementById('d-sum').value),
+        links: await out(document.getElementById('d-links').value),
       });
       meta = await api('GET', '/api/meta');
       toast('Saved');
@@ -448,7 +650,7 @@ async function renderProject(slug) {
   const note = document.getElementById('note');
   const addNote = () => guard(async () => {
     if (!note.value.trim()) return note.focus();
-    await api('POST', `${base}/notes`, { body: note.value });
+    await api('POST', `${base}/notes`, { body: await out(note.value) });
     note.value = '';
     toast('Note added');
     renderProject(p.slug);
@@ -472,7 +674,7 @@ async function renderProject(slug) {
       body.innerHTML = `<textarea>${esc(n.body)}</textarea><div class="row end" style="margin-top:8px"><button class="ghost" data-c>Cancel</button><button class="primary" data-s>Save</button></div>`;
       const ta = body.querySelector('textarea');
       ta.focus();
-      const save = () => guard(async () => { await api('PATCH', `/api/notes/${id}`, { body: ta.value }); toast('Saved'); renderProject(p.slug); });
+      const save = () => guard(async () => { await api('PATCH', `/api/notes/${id}`, { body: await out(ta.value) }); toast('Saved'); renderProject(p.slug); });
       body.querySelector('[data-s]').onclick = save;
       body.querySelector('[data-c]').onclick = () => { ta.value = ''; renderProject(p.slug); };
       submitOnCmdEnter(ta, save);
@@ -480,30 +682,86 @@ async function renderProject(slug) {
   });
 
   // Tasks
-  const sd = app.querySelector('[data-showdone]');
-  if (sd) sd.onclick = () => { pref.showDoneTasks = !showDone; savePref(); renderProject(p.slug); };
-  const to = app.querySelector('[data-taskorder]');
-  if (to) to.onclick = () => { pref.newestTasksFirst = !newestFirst; savePref(); renderProject(p.slug); };
+  app.querySelectorAll('[data-showdone]').forEach(b => b.onclick = () => { pref.showDoneTasks = !showDone; savePref(); renderProject(p.slug); });
+  app.querySelectorAll('[data-taskorder]').forEach(b => b.onclick = () => { pref.newestTasksFirst = !newestFirst; savePref(); renderProject(p.slug); });
   app.querySelectorAll('[data-task]').forEach(cb => cb.onchange = () => guard(async () => {
     await api('PATCH', `/api/tasks/${cb.dataset.task}`, { done: cb.checked });
     renderProject(p.slug);
   }));
-  wireMoves(app.querySelector('.a-tasks'), p, () => renderProject(p.slug));
+  wireMoves(app, [...p.tasks, ...p.ideas, ...elsewhere], p.slug, () => renderProject(p.slug));
+  wireWont(app, () => renderProject(p.slug));
+  app.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => guard(async () => {
+    await api('PATCH', `/api/tasks/${b.dataset.id}`, { kind: b.dataset.kind });
+    toast(b.dataset.kind === 'idea' ? 'Moved to ideas' : 'Moved to tasks');
+    renderProject(p.slug);
+  }));
   app.querySelectorAll('[data-deltask]').forEach(b => b.onclick = () => guard(async () => {
     await api('DELETE', `/api/tasks/${b.dataset.deltask}`);
     renderProject(p.slug);
   }));
-  document.getElementById('task-form').onsubmit = e => {
+  app.querySelectorAll('[data-add]').forEach(form => form.onsubmit = e => {
     e.preventDefault();
-    const inp = document.getElementById('task');
+    const inp = form.querySelector('input');
     if (!inp.value.trim()) return inp.focus();
     guard(async () => {
-      await api('POST', `${base}/tasks`, { text: inp.value });
+      await api('POST', `${base}/${form.dataset.add}`, { text: await out(inp.value) });
       inp.value = '';
       await renderProject(p.slug);
-      document.getElementById('task').focus();
+      app.querySelector(`[data-add="${form.dataset.add}"] input`).focus();
     });
-  };
+  });
+}
+
+// ---- everything to do ---------------------------------------------------------------
+
+// Every open task (or idea) on one page, a panel per project in columns: the to-do (or ideas) list
+// first, then projects, most recently active first. Private projects' only when unlocked.
+async function renderTodos(which = 'todos') {
+  const ideas = which === 'ideas';
+  const again = () => renderTodos(which);
+  const items = await api('GET', `/api/tasks?kind=${ideas ? 'idea' : 'task'}`);
+  const groups = [];
+  for (const t of items) {
+    const g = groups.at(-1);
+    if (g && g.slug === t.project_slug) g.tasks.push(t);
+    else groups.push({ slug: t.project_slug, name: t.project_name, status: t.project_status, private: t.project_private, tasks: [t] });
+  }
+  const locked = groups.filter(g => g.private && !vault.key).length;
+  const shown = groups.filter(g => !g.private || vault.key);
+  for (const g of shown.filter(g => g.private)) {
+    g.name = await unsealOr(g.name);
+    for (const t of g.tasks) t.text = await unsealOr(t.text);
+  }
+  const count = shown.reduce((n, g) => n + g.tasks.length, 0);
+  app.innerHTML = `
+    <a class="back" href="#/">← All projects</a>
+    <div class="proj-head">
+      <div><h1>${ideas ? 'All ideas' : 'Everything to do'}</h1><div class="sub">${count} ${ideas ? 'idea' : 'open task'}${count === 1 ? '' : 's'} in ${shown.length} place${shown.length === 1 ? '' : 's'}</div></div>
+      ${locked ? `<button class="ghost" data-vault>${lockIcon} Unlock ${locked} private</button>` : ''}
+    </div>
+    <div class="chips" role="tablist" aria-label="Show">
+      <a class="chip" role="tab" href="#/todos" aria-pressed="${!ideas}" aria-selected="${!ideas}">Tasks</a>
+      <a class="chip" role="tab" href="#/ideas" aria-pressed="${ideas}" aria-selected="${ideas}">Ideas</a>
+    </div>
+    ${shown.length ? `<div class="all-todos">${shown.map(g => `
+      <section class="panel">
+        <h2><a href="#/p/${encodeURIComponent(g.slug)}">${g.private ? `${lockIcon} ` : ''}${esc(g.name)}</a><span>${g.slug === TODO_SLUG ? '' : pill(g.status)} <span class="hint">${g.tasks.length}</span></span></h2>
+        <ul class="tasks">${g.tasks.map(t => `
+          <li>
+            <input type="checkbox" data-tick="${t.id}" aria-label="${esc(t.text)}">
+            <span class="t">${rich(t.text)}</span>
+            <span class="acts">${moveButton(t)}${wontButton(t)}</span>
+          </li>`).join('')}</ul>
+      </section>`).join('')}</div>` : `<div class="panel"><p class="empty">${ideas ? 'No ideas yet.' : 'Nothing to do anywhere. Nice.'}</p></div>`}`;
+  const vb = app.querySelector('[data-vault]');
+  if (vb) vb.onclick = async () => { if (await unlock()) again(); };
+  app.querySelectorAll('[data-tick]').forEach(cb => cb.onchange = () => guard(async () => {
+    await api('PATCH', `/api/tasks/${cb.dataset.tick}`, { done: cb.checked });
+    toast('Done ✓');
+    again();
+  }));
+  wireMoves(app, items, null, again);
+  wireWont(app, again);
 }
 
 // ---- new project ------------------------------------------------------------------
@@ -523,19 +781,24 @@ function renderNew() {
         <div class="field"><label for="n-next">Next step</label><input id="n-next" placeholder="The very next thing to do"></div>
         <div class="field"><label for="n-sum">Summary</label><textarea id="n-sum" placeholder="What is it, and why does it matter?"></textarea></div>
         <div class="field"><label for="n-links">Links and paths <span class="hint">(one per line)</span></label><textarea id="n-links" style="min-height:60px"></textarea></div>
+        <label class="check"><input type="checkbox" id="n-private"> Private <span class="hint">: encrypted with your passphrase, and hidden from agents and the assistant</span></label>
         <div class="row end"><a class="btn" href="#/">Cancel</a><button class="primary">Create project</button></div>
       </form>
     </div>`;
   document.getElementById('np').onsubmit = e => {
     e.preventDefault();
     guard(async () => {
+      const priv = document.getElementById('n-private').checked;
+      if (priv && !await unlock()) return;
+      const out = text => priv ? seal(text) : text;
       const p = await api('POST', '/api/projects', {
-        name: document.getElementById('n-name').value,
+        name: await out(document.getElementById('n-name').value),
         category: document.getElementById('n-cat').value,
         status: document.getElementById('n-status').value,
-        next_step: document.getElementById('n-next').value,
-        summary: document.getElementById('n-sum').value,
-        links: document.getElementById('n-links').value,
+        next_step: await out(document.getElementById('n-next').value),
+        summary: await out(document.getElementById('n-sum').value),
+        links: await out(document.getElementById('n-links').value),
+        private: priv,
       });
       meta = await api('GET', '/api/meta');
       location.hash = `#/p/${encodeURIComponent(p.slug)}`;
@@ -561,7 +824,7 @@ async function renderSearch(q) {
   const r = await api('GET', `/api/search?q=${encodeURIComponent(q)}`);
   const out = [];
   if (r.projects.length) out.push(`<h2>Projects</h2><div class="cards">${r.projects.map(card).join('')}</div>`);
-  if (r.tasks.length) out.push(`<h2>Tasks</h2><ul class="panel feed">${r.tasks.map(t => `<li>${t.done ? '✓ ' : ''}${rich(t.text)}</li>`).join('')}</ul>`);
+  if (r.tasks.length) out.push(`<h2>Tasks</h2><ul class="panel feed">${r.tasks.map(t => `<li>${t.done ? '✓ ' : ''}${t.wont_do ? '<span class="hint">won\'t do</span> ' : ''}${t.kind === 'idea' ? '<span class="hint">idea</span> ' : ''}${rich(t.text)}</li>`).join('')}</ul>`);
   if (r.notes.length) out.push(`<h2>Notes</h2><ul class="panel feed">${r.notes.map(n => `
     <li><div class="who"><a href="#/p/${encodeURIComponent(n.project_slug)}">${esc(n.project_name)}</a> · ${ago(n.created_at)}</div><div class="body">${rich(n.body)}</div></li>`).join('')}</ul>`);
   document.getElementById('sr').innerHTML = out.join('') || '<p class="empty" style="margin-top:16px">Nothing found.</p>';

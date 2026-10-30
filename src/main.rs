@@ -114,10 +114,14 @@ enum Cmd {
         #[arg(short, long)]
         all: bool,
     },
-    /// Your ideas list: `catapp idea` shows it, `catapp idea some thing` adds to it
+    /// Your ideas: `catapp idea` shows them, `catapp idea some thing` adds to the general list,
+    /// `-p <project>` shows or adds to a project's own ideas
     #[command(alias = "ideas")]
     Idea {
         text: Vec<String>,
+        /// A project's own ideas, instead of the general list
+        #[arg(short, long)]
+        project: Option<String>,
         /// Include done items
         #[arg(short, long)]
         all: bool,
@@ -163,10 +167,16 @@ enum TaskCmd {
     Add { project: String, text: Vec<String> },
     /// Mark a task done
     Done { id: i64 },
-    /// Mark a task not done
+    /// Put a task back on the list (not done, and not won't do)
     Undo { id: i64 },
-    /// Move a task to another project (or `todo`, `ideas`)
+    /// Decide not to do a task or idea: it's kept on record, off the list (`undo` puts it back)
+    Wontdo { id: i64 },
+    /// Move a task or idea to another project (or `todo`, `ideas`)
     Mv { id: i64, project: String },
+    /// Turn a task into an idea
+    ToIdea { id: i64 },
+    /// Turn an idea into a task
+    ToTask { id: i64 },
     /// Delete a task
     Rm { id: i64 },
 }
@@ -290,14 +300,53 @@ fn list_cmd(slug: &str, text: Vec<String>, all: bool, empty: &str) -> Result<(),
         return Ok(());
     }
     let tasks = db.tasks(p.id).map_err(|e| e.to_string())?;
-    let shown: Vec<_> = tasks.iter().filter(|t| all || !t.done).collect();
+    print_items(&tasks, all, empty);
+    if slug == IDEAS_SLUG {
+        let mut last = String::new();
+        for i in db.project_ideas().map_err(|e| e.to_string())? {
+            if i.project_slug != last {
+                println!("\n{} ({}):", i.project_name, i.project_slug);
+                last = i.project_slug.clone();
+            }
+            println!("  [ ] {}  (#{})", i.item.text, i.item.id);
+        }
+    }
+    Ok(())
+}
+
+/// `catapp idea -p <project>`: show a project's own ideas, or add to them.
+fn project_ideas_cmd(project: &str, text: Vec<String>, all: bool) -> Result<(), String> {
+    let db = open_db()?;
+    let p = db.find_or_list(project, &brand::Brand::load(&home()).owner, "cli").map_err(|e| e.to_string())?;
+    if !text.is_empty() {
+        let t = db.add_idea(p.id, &text.join(" ")).map_err(|e| e.to_string())?;
+        println!("Added idea #{} to {}: {}", t.id, p.name, t.text);
+        return Ok(());
+    }
+    let ideas = db.items(p.id, "idea").map_err(|e| e.to_string())?;
+    print_items(&ideas, all, &format!("No ideas on {} yet. Add one: catapp idea -p {} some thing", p.name, p.slug));
+    Ok(())
+}
+
+fn print_items(items: &[db::Task], all: bool, empty: &str) {
+    let shown: Vec<_> = items.iter().filter(|t| all || !(t.done || t.wont_do)).collect();
     if shown.is_empty() {
         println!("{empty}");
     }
     for t in shown {
-        println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
+        println!("  [{}] {}  (#{})", mark(t), t.text, t.id);
     }
-    Ok(())
+}
+
+/// x for done, - for won't do.
+fn mark(t: &db::Task) -> &'static str {
+    if t.done {
+        "x"
+    } else if t.wont_do {
+        "-"
+    } else {
+        " "
+    }
 }
 
 fn json_out<T: serde::Serialize>(v: &T) {
@@ -310,7 +359,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::Serve { port, bind } => {
             let port = port.unwrap_or(brand::Brand::load(&home()).port);
             let state = Arc::new(web::AppState {
-                db: Mutex::new(open_db()?),
+                db: Mutex::new(open_db()?.show_private()),
                 token: token()?,
                 home: home(),
                 assistant: tokio::sync::Mutex::new(()),
@@ -402,7 +451,14 @@ fn run(cli: Cli) -> Result<(), String> {
             if !d.tasks.is_empty() {
                 println!("\nTasks ({}/{}):", p.tasks_done, p.tasks_total);
                 for t in &d.tasks {
-                    println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
+                    println!("  [{}] {}  (#{})", mark(t), t.text, t.id);
+                }
+            }
+            let ideas: Vec<_> = d.ideas.iter().filter(|t| !t.done && !t.wont_do).collect();
+            if !ideas.is_empty() {
+                println!("\nIdeas:");
+                for t in ideas {
+                    println!("  - {}  (#{})", t.text, t.id);
                 }
             }
             if !d.notes.is_empty() {
@@ -414,7 +470,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::New { name, category, status, summary, next, links } => {
             let p = open_db()?
-                .create(NewProject { name, category: Some(category), status: Some(status), summary, next_step: next, links }, "cli")
+                .create(NewProject { name, category: Some(category), status: Some(status), summary, next_step: next, links, ..Default::default() }, "cli")
                 .map_err(e)?;
             println!("Created {} ({}, {})", p.name, p.slug, p.category);
         }
@@ -444,10 +500,19 @@ fn run(cli: Cli) -> Result<(), String> {
                     let t = db.add_task(p.id, &text_or_stdin(text)?).map_err(e)?;
                     println!("Added task #{} to {}", t.id, p.name);
                 }
-                TaskCmd::Done { id } | TaskCmd::Undo { id } => {
-                    let done = matches!(cmd, TaskCmd::Done { .. });
-                    let t = db.update_task(id, TaskPatch { done: Some(done), text: None }).map_err(e)?;
-                    println!("[{}] {}", if t.done { "x" } else { " " }, t.text);
+                TaskCmd::Done { id } | TaskCmd::Undo { id } | TaskCmd::Wontdo { id } => {
+                    let patch = match cmd {
+                        TaskCmd::Done { .. } => TaskPatch { done: Some(true), ..Default::default() },
+                        TaskCmd::Wontdo { .. } => TaskPatch { wont_do: Some(true), ..Default::default() },
+                        _ => TaskPatch { done: Some(false), wont_do: Some(false), ..Default::default() },
+                    };
+                    let t = db.update_task(id, patch).map_err(e)?;
+                    println!("[{}] {}", mark(&t), t.text);
+                }
+                TaskCmd::ToIdea { id } | TaskCmd::ToTask { id } => {
+                    let kind = if matches!(cmd, TaskCmd::ToIdea { .. }) { "idea" } else { "task" };
+                    let t = db.update_task(id, TaskPatch { kind: Some(kind.into()), ..Default::default() }).map_err(e)?;
+                    println!("#{} is now {} {}: {}", t.id, if kind == "idea" { "an" } else { "a" }, kind, t.text);
                 }
                 TaskCmd::Mv { id, project } => {
                     let p = db.find_or_list(&project, &brand::Brand::load(&home()).owner, "cli").map_err(e)?;
@@ -461,7 +526,8 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Cmd::Todo { text, all } => list_cmd(TODO_SLUG, text, all, "Nothing to do. Add something: catapp todo buy milk")?,
-        Cmd::Idea { text, all } => list_cmd(IDEAS_SLUG, text, all, "No ideas yet. Add one: catapp idea learn to juggle")?,
+        Cmd::Idea { text, project: Some(project), all } => project_ideas_cmd(&project, text, all)?,
+        Cmd::Idea { text, project: None, all } => list_cmd(IDEAS_SLUG, text, all, "No ideas yet. Add one: catapp idea learn to juggle")?,
         Cmd::Recent { limit, category } => {
             let db = open_db()?;
             let cat = category.as_deref().map(db::norm_category);

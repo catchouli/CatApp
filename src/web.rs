@@ -66,6 +66,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{slug}", get(get_project).patch(update_project).delete(delete_project))
         .route("/api/projects/{slug}/notes", post(add_note))
         .route("/api/projects/{slug}/tasks", post(add_task))
+        .route("/api/projects/{slug}/ideas", post(add_idea))
+        .route("/api/ideas", get(project_ideas))
+        .route("/api/tasks", get(open_tasks))
+        .route("/api/private", get(get_vault).put(set_vault))
         .route("/api/notes/{id}", patch(edit_note).delete(delete_note))
         .route("/api/tasks/{id}", patch(update_task).delete(delete_task))
         .route("/api/tasks/{id}/move", post(move_task))
@@ -264,6 +268,40 @@ async fn add_task(State(st): St, Path(slug): Path<String>, Json(b): Json<TaskBod
     ok(db.add_task(p.id, &b.text)?)
 }
 
+async fn add_idea(State(st): St, Path(slug): Path<String>, Json(b): Json<TaskBody>) -> R {
+    let db = st.db.lock().unwrap();
+    let p = db.find_or_list(&slug, &Brand::load(&st.home).owner, "web")?;
+    ok(db.add_idea(p.id, &b.text)?)
+}
+
+async fn project_ideas(State(st): St) -> R {
+    ok(st.db.lock().unwrap().project_ideas()?)
+}
+
+#[derive(Deserialize)]
+struct KindQ {
+    kind: Option<String>,
+}
+
+/// Every open task (or idea, with ?kind=idea), for the overview page.
+async fn open_tasks(State(st): St, Query(q): Query<KindQ>) -> R {
+    ok(st.db.lock().unwrap().open_items_everywhere(q.kind.as_deref().unwrap_or("task"))?)
+}
+
+/// The salt and check value for the private projects' passphrase (null until one is set). The
+/// passphrase itself never leaves the browser.
+async fn get_vault(State(st): St) -> R {
+    ok(st.db.lock().unwrap().vault()?)
+}
+
+async fn set_vault(State(st): St, Json(v): Json<Value>) -> R {
+    if !["salt", "check"].iter().all(|k| v.get(k).is_some_and(Value::is_string)) {
+        return Err(db::Error::Invalid("needs salt and check".into()).into());
+    }
+    st.db.lock().unwrap().set_vault(&v)?;
+    ok(json!({ "ok": true }))
+}
+
 #[derive(Deserialize)]
 struct MoveBody {
     project: String,
@@ -334,8 +372,9 @@ pub(crate) fn assistant_prompt(b: &Brand) -> String {
 on their phone: \"add a project for X\", \"add a to-do to Y\", \"note on <project> that Z\", \"what's next on \
 <project>?\". Use the {slug} tools to do it, then reply in one or two short plain sentences saying exactly what you \
 did (name the project). The to-do list is the project with slug 'todo': add to-dos there with add_task. \
-The ideas list is the project with slug 'ideas': \"add an idea\", \"idea: ...\" go there. To move a task to another project \
-or list, use update_task with project. \
+Each project has its own ideas list too: \"an idea for <project>\" goes there with add_task and idea true. \
+The general ideas list is the project with slug 'ideas': \"add an idea\", \"idea: ...\" that don't name a project go there. \
+To move a task or idea to another project or list, use update_task with project; idea true/false turns a task into an idea or back. \
 \"the to-do list\", \"my to-dos\", \"the main list\" and any to-do that doesn't name a project all mean that list: add it \
 there without searching or asking which project. New projects \
 default to category 'personal' and status 'active' unless {owner} says otherwise. Pass source 'assistant' when adding \

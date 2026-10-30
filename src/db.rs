@@ -4,6 +4,7 @@
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -78,6 +79,10 @@ pub struct Project {
     pub note_count: i64,
     pub tasks_done: i64,
     pub tasks_total: i64,
+    /// Ideas not yet ticked off.
+    pub ideas_open: i64,
+    /// Encrypted in the browser and hidden from everything but the web app (see `Db::show_private`).
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,11 +106,16 @@ pub struct Note {
 pub struct Task {
     pub id: i64,
     pub project_id: i64,
+    /// "task" for the checklist, "idea" for things to maybe do some day.
+    pub kind: String,
     pub text: String,
     pub done: bool,
     pub position: i64,
     pub created_at: String,
     pub done_at: Option<String>,
+    /// Decided against: kept for the record, but not open and not done.
+    pub wont_do: bool,
+    pub wont_do_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,7 +123,19 @@ pub struct ProjectDetail {
     #[serde(flatten)]
     pub project: Project,
     pub tasks: Vec<Task>,
+    pub ideas: Vec<Task>,
     pub notes: Vec<Note>,
+}
+
+/// A task or idea with the project it's on, for the pages that gather them from every project.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectItem {
+    #[serde(flatten)]
+    pub item: Task,
+    pub project_slug: String,
+    pub project_name: String,
+    pub project_status: String,
+    pub project_private: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -129,6 +151,9 @@ pub struct NewProject {
     pub next_step: Option<String>,
     #[serde(default)]
     pub links: Option<String>,
+    /// Its text comes already encrypted (only the web app makes these).
+    #[serde(default)]
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -153,20 +178,31 @@ pub struct TaskPatch {
     pub text: Option<String>,
     #[serde(default)]
     pub done: Option<bool>,
+    /// "task" or "idea": turns one into the other.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Decided against it (true), or put it back (false). Ticking it done clears this.
+    #[serde(default)]
+    pub wont_do: Option<bool>,
 }
 
 const PROJECT_SELECT: &str = "SELECT p.id, p.slug, p.name, p.category, p.status, p.summary, p.next_step, p.links,
     p.created_at, p.updated_at,
     MAX(p.updated_at, COALESCE((SELECT MAX(n.created_at) FROM notes n WHERE n.project_id = p.id), '')),
     (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id AND n.kind = 'note'),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.done = 1),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id)
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task' AND t.done = 1),
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task' AND t.wont_do_at IS NULL),
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'idea' AND t.done = 0 AND t.wont_do_at IS NULL),
+    p.private
     FROM projects p";
 
 const NOTE_SELECT: &str = "SELECT n.id, n.project_id, p.slug, p.name, p.category, n.kind, n.body, n.source,
     n.created_at, n.edited_at FROM notes n JOIN projects p ON p.id = n.project_id";
 
-const TASK_SELECT: &str = "SELECT id, project_id, text, done, position, created_at, done_at FROM tasks";
+const TASK_SELECT: &str = "SELECT id, project_id, kind, text, done, position, created_at, done_at, wont_do_at FROM tasks";
+
+/// What a checklist item can be.
+pub const KINDS: &[&str] = &["task", "idea"];
 
 fn project_row(r: &Row) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -184,6 +220,8 @@ fn project_row(r: &Row) -> rusqlite::Result<Project> {
         note_count: r.get(11)?,
         tasks_done: r.get(12)?,
         tasks_total: r.get(13)?,
+        ideas_open: r.get(14)?,
+        private: r.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -206,11 +244,14 @@ fn task_row(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
         project_id: r.get(1)?,
-        text: r.get(2)?,
-        done: r.get::<_, i64>(3)? != 0,
-        position: r.get(4)?,
-        created_at: r.get(5)?,
-        done_at: r.get(6)?,
+        kind: r.get(2)?,
+        text: r.get(3)?,
+        done: r.get::<_, i64>(4)? != 0,
+        position: r.get(5)?,
+        created_at: r.get(6)?,
+        done_at: r.get(7)?,
+        wont_do: r.get::<_, Option<String>>(8)?.is_some(),
+        wont_do_at: r.get(8)?,
     })
 }
 
@@ -250,6 +291,24 @@ fn check_status(s: &str) -> Result<String> {
     }
 }
 
+fn check_kind(k: &str) -> Result<String> {
+    let k = k.trim().to_lowercase();
+    if KINDS.contains(&k.as_str()) {
+        Ok(k)
+    } else {
+        Err(Error::Invalid(format!("unknown kind '{k}': use task or idea")))
+    }
+}
+
+/// What everything on a built-in list is: tasks on the to-do list, ideas on the ideas list.
+fn list_kind(slug: &str) -> Option<&'static str> {
+    match slug {
+        TODO_SLUG => Some("task"),
+        IDEAS_SLUG => Some("idea"),
+        _ => None,
+    }
+}
+
 fn non_empty(s: &str, what: &str) -> Result<String> {
     let s = s.trim();
     if s.is_empty() {
@@ -261,6 +320,9 @@ fn non_empty(s: &str, what: &str) -> Result<String> {
 
 pub struct Db {
     conn: Connection,
+    /// Whether private projects exist as far as callers can tell. Only the web app turns this on: to
+    /// the CLI, MCP and the assistant they're simply not there. Their text is encrypted either way.
+    private: bool,
 }
 
 impl Db {
@@ -315,7 +377,73 @@ impl Db {
                 PRAGMA user_version = 1;",
             )?;
         }
-        Ok(Db { conn })
+        if version < 2 {
+            // Checklist items become tasks or ideas; the ideas list's items are ideas.
+            conn.execute_batch(&format!(
+                "BEGIN;
+                ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
+                UPDATE tasks SET kind = 'idea' WHERE project_id IN (SELECT id FROM projects WHERE slug = '{IDEAS_SLUG}');
+                PRAGMA user_version = 2;
+                COMMIT;"
+            ))?;
+        }
+        if version < 3 {
+            // Private projects, and somewhere to keep the salt and check value for their passphrase.
+            conn.execute_batch(
+                "BEGIN;
+                ALTER TABLE projects ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                PRAGMA user_version = 3;
+                COMMIT;",
+            )?;
+        }
+        if version < 4 {
+            conn.execute_batch(
+                "BEGIN;
+                ALTER TABLE tasks ADD COLUMN wont_do_at TEXT;
+                PRAGMA user_version = 4;
+                COMMIT;",
+            )?;
+        }
+        Ok(Db { conn, private: false })
+    }
+
+    /// Lets this connection see private projects. For the web app only.
+    pub fn show_private(mut self) -> Db {
+        self.private = true;
+        self
+    }
+
+    fn hidden(&self, p: &Project) -> bool {
+        p.private && !self.private
+    }
+
+    // ---- private projects ------------------------------------------------------------
+
+    /// The passphrase's salt and check value, as the browser stored them, if one has been set.
+    pub fn vault(&self) -> Result<Option<Value>> {
+        self.require_private()?;
+        let v: Option<String> = self.conn.query_row("SELECT value FROM settings WHERE key = 'vault'", [], |r| r.get(0)).optional()?;
+        Ok(v.and_then(|v| serde_json::from_str(&v).ok()))
+    }
+
+    /// Stores the passphrase's salt and check value. Only once: changing the passphrase would mean
+    /// re-encrypting everything.
+    pub fn set_vault(&self, v: &Value) -> Result<()> {
+        self.require_private()?;
+        if self.vault()?.is_some() {
+            return Err(Error::Invalid("the passphrase is already set".into()));
+        }
+        self.conn.execute("INSERT INTO settings (key, value) VALUES ('vault', ?1)", [v.to_string()])?;
+        Ok(())
+    }
+
+    fn require_private(&self) -> Result<()> {
+        if self.private {
+            Ok(())
+        } else {
+            Err(Error::NotFound("private projects are only in the web app".into()))
+        }
     }
 
     // ---- projects ------------------------------------------------------------------
@@ -324,13 +452,14 @@ impl Db {
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut st = self.conn.prepare(&format!("{PROJECT_SELECT} ORDER BY 11 DESC"))?;
         let rows = st.query_map([], project_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(rows.into_iter().filter(|p| !self.hidden(p)).collect())
     }
 
     pub fn project_by_id(&self, id: i64) -> Result<Project> {
         self.conn
             .query_row(&format!("{PROJECT_SELECT} WHERE p.id = ?1"), [id], project_row)
             .optional()?
+            .filter(|p| !self.hidden(p))
             .ok_or_else(|| Error::NotFound(format!("no project with id {id}")))
     }
 
@@ -413,7 +542,8 @@ impl Db {
     pub fn detail(&self, project: &Project, notes_limit: usize) -> Result<ProjectDetail> {
         Ok(ProjectDetail {
             project: project.clone(),
-            tasks: self.tasks(project.id)?,
+            tasks: self.items(project.id, "task")?,
+            ideas: self.items(project.id, "idea")?,
             notes: self.notes(project.id, notes_limit)?,
         })
     }
@@ -422,7 +552,11 @@ impl Db {
         let name = non_empty(&p.name, "name")?;
         let category = norm_category(p.category.as_deref().unwrap_or(""));
         let status = check_status(p.status.as_deref().unwrap_or("active"))?;
-        let base = slugify(&name);
+        if p.private {
+            self.require_private()?;
+        }
+        // A private project's name is encrypted, so its slug can't come from it.
+        let base = if p.private { "private".into() } else { slugify(&name) };
         let mut slug = base.clone();
         let mut n = 2;
         while self.conn.query_row("SELECT 1 FROM projects WHERE slug = ?1", [&slug], |_| Ok(())).optional()?.is_some() {
@@ -431,8 +565,8 @@ impl Db {
         }
         let t = now();
         self.conn.execute(
-            "INSERT INTO projects (slug, name, category, status, summary, next_step, links, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            "INSERT INTO projects (slug, name, category, status, summary, next_step, links, created_at, updated_at, private)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
             params![
                 slug,
                 name,
@@ -441,7 +575,8 @@ impl Db {
                 p.summary.unwrap_or_default().trim(),
                 p.next_step.unwrap_or_default().trim(),
                 p.links.unwrap_or_default().trim(),
-                t
+                t,
+                p.private as i64
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -474,7 +609,9 @@ impl Db {
             self.add_entry(id, "status", &format!("Status: {} → {}", cur.status, status), source)?;
         }
         if next_step != cur.next_step && !next_step.is_empty() {
-            self.add_entry(id, "next", &format!("Next step: {next_step}"), source)?;
+            // A private project's next step is encrypted, so its entry is just that; the app adds the words.
+            let body = if cur.private { next_step.clone() } else { format!("Next step: {next_step}") };
+            self.add_entry(id, "next", &body, source)?;
         }
         self.project_by_id(id)
     }
@@ -518,7 +655,7 @@ impl Db {
 
     pub fn note(&self, id: i64) -> Result<Note> {
         self.conn
-            .query_row(&format!("{NOTE_SELECT} WHERE n.id = ?1"), [id], note_row)
+            .query_row(&format!("{NOTE_SELECT} WHERE n.id = ?1 AND (?2 OR p.private = 0)"), params![id, self.private], note_row)
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("no note with id {id}")))
     }
@@ -534,6 +671,7 @@ impl Db {
 
     pub fn edit_note(&self, id: i64, body: &str) -> Result<Note> {
         let body = non_empty(body, "a note")?;
+        self.note(id)?;
         let n = self.conn.execute("UPDATE notes SET body = ?1, edited_at = ?2 WHERE id = ?3", params![body, now(), id])?;
         if n == 0 {
             return Err(Error::NotFound(format!("no note with id {id}")));
@@ -542,63 +680,123 @@ impl Db {
     }
 
     pub fn delete_note(&self, id: i64) -> Result<()> {
+        self.note(id)?;
         if self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])? == 0 {
             return Err(Error::NotFound(format!("no note with id {id}")));
         }
         Ok(())
     }
 
-    /// Recent notes across projects (written notes only, not status changes).
+    /// Recent notes across projects (written notes only, not status changes). Never private ones.
     pub fn recent(&self, limit: usize, category: Option<&str>) -> Result<Vec<Note>> {
         let mut st = self.conn.prepare(&format!(
-            "{NOTE_SELECT} WHERE n.kind = 'note' AND (?1 IS NULL OR p.category = ?1)
+            "{NOTE_SELECT} WHERE n.kind = 'note' AND p.private = 0 AND (?1 IS NULL OR p.category = ?1)
              ORDER BY n.created_at DESC, n.id DESC LIMIT ?2"
         ))?;
         let rows = st.query_map(params![category, limit as i64], note_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// Notes, projects and tasks containing the text (case-insensitive).
+    /// Notes, projects and tasks containing the text (case-insensitive). Private projects are
+    /// encrypted, so they're never searched.
     pub fn search(&self, q: &str) -> Result<(Vec<Project>, Vec<Note>, Vec<Task>)> {
         let q = non_empty(q, "a search")?.to_lowercase();
         let projects = self
             .projects()?
             .into_iter()
+            .filter(|p| !p.private)
             .filter(|p| [&p.name, &p.summary, &p.next_step, &p.links].iter().any(|s| s.to_lowercase().contains(&q)))
             .collect();
         let pat = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         let mut st = self.conn.prepare(&format!(
-            "{NOTE_SELECT} WHERE lower(n.body) LIKE ?1 ESCAPE '\\' ORDER BY n.created_at DESC LIMIT 50"
+            "{NOTE_SELECT} WHERE lower(n.body) LIKE ?1 ESCAPE '\\' AND p.private = 0 ORDER BY n.created_at DESC LIMIT 50"
         ))?;
         let notes = st.query_map([&pat], note_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut st = self.conn.prepare(&format!("{TASK_SELECT} WHERE lower(text) LIKE ?1 ESCAPE '\\' LIMIT 50"))?;
+        let mut st = self.conn.prepare(&format!(
+            "{TASK_SELECT} WHERE lower(text) LIKE ?1 ESCAPE '\\'
+             AND project_id IN (SELECT id FROM projects WHERE private = 0) LIMIT 50"
+        ))?;
         let tasks = st.query_map([&pat], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((projects, notes, tasks))
     }
 
     // ---- tasks ---------------------------------------------------------------------
 
+    /// A project's tasks and ideas, in checklist order.
     pub fn tasks(&self, project_id: i64) -> Result<Vec<Task>> {
         let mut st = self.conn.prepare(&format!("{TASK_SELECT} WHERE project_id = ?1 ORDER BY position, id"))?;
         let rows = st.query_map([project_id], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
+    /// Just a project's tasks, or just its ideas.
+    pub fn items(&self, project_id: i64, kind: &str) -> Result<Vec<Task>> {
+        Ok(self.tasks(project_id)?.into_iter().filter(|t| t.kind == kind).collect())
+    }
+
+    /// Open ideas on projects' own ideas lists (not the general one), most recently active project first.
+    pub fn project_ideas(&self) -> Result<Vec<ProjectItem>> {
+        Ok(self.open_items("idea", false)?.into_iter().filter(|i| i.project_slug != IDEAS_SLUG).collect())
+    }
+
+    /// Every open task or idea (`kind`): the to-do or ideas list's first, then each project's, most
+    /// recently active first. Private projects' too, for the web app.
+    pub fn open_items_everywhere(&self, kind: &str) -> Result<Vec<ProjectItem>> {
+        self.open_items(&check_kind(kind)?, self.private)
+    }
+
+    fn open_items(&self, kind: &str, private: bool) -> Result<Vec<ProjectItem>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.id, t.project_id, t.kind, t.text, t.done, t.position, t.created_at, t.done_at, t.wont_do_at,
+                p.slug, p.name, p.status, p.private
+             FROM tasks t JOIN projects p ON p.id = t.project_id
+             WHERE t.kind = ?1 AND t.done = 0 AND t.wont_do_at IS NULL AND (?2 OR p.private = 0)
+             ORDER BY p.slug IN (?3, ?4) DESC, p.updated_at DESC, p.id, t.position, t.id",
+        )?;
+        let rows = st
+            .query_map(params![kind, private, TODO_SLUG, IDEAS_SLUG], |r| {
+                Ok(ProjectItem {
+                    item: task_row(r)?,
+                    project_slug: r.get(9)?,
+                    project_name: r.get(10)?,
+                    project_status: r.get(11)?,
+                    project_private: r.get::<_, i64>(12)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn task(&self, id: i64) -> Result<Task> {
         self.conn
-            .query_row(&format!("{TASK_SELECT} WHERE id = ?1"), [id], task_row)
+            .query_row(
+                &format!("{TASK_SELECT} WHERE id = ?1 AND (?2 OR project_id IN (SELECT id FROM projects WHERE private = 0))"),
+                params![id, self.private],
+                task_row,
+            )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("no task with id {id}")))
     }
 
+    /// Adds a task (an idea on the ideas list).
     pub fn add_task(&self, project_id: i64, text: &str) -> Result<Task> {
-        let text = non_empty(text, "a task")?;
-        self.project_by_id(project_id)?;
+        self.add_item(project_id, text, "task")
+    }
+
+    /// Adds an idea to a project's own ideas list (or the general one).
+    pub fn add_idea(&self, project_id: i64, text: &str) -> Result<Task> {
+        self.add_item(project_id, text, "idea")
+    }
+
+    fn add_item(&self, project_id: i64, text: &str, kind: &str) -> Result<Task> {
+        let text = non_empty(text, if kind == "idea" { "an idea" } else { "a task" })?;
+        let p = self.project_by_id(project_id)?;
+        let kind = list_kind(&p.slug).unwrap_or(kind);
         let pos: i64 =
             self.conn.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM tasks WHERE project_id = ?1", [project_id], |r| r.get(0))?;
         self.conn.execute(
-            "INSERT INTO tasks (project_id, text, position, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, text, pos, now()],
+            "INSERT INTO tasks (project_id, kind, text, position, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, kind, text, pos, now()],
         )?;
         self.touch(project_id)?;
         self.task(self.conn.last_insert_rowid())
@@ -610,26 +808,50 @@ impl Db {
             Some(t) => non_empty(t, "a task")?,
             None => cur.text.clone(),
         };
-        let done = patch.done.unwrap_or(cur.done);
+        // Done and won't-do rule each other out: setting one clears the other.
+        if patch.done == Some(true) && patch.wont_do == Some(true) {
+            return Err(Error::Invalid("it can't be both done and won't do".into()));
+        }
+        let wont_do = if patch.done == Some(true) { false } else { patch.wont_do.unwrap_or(cur.wont_do) };
+        let done = if wont_do { false } else { patch.done.unwrap_or(cur.done) };
         let done_at = if done { cur.done_at.clone().or_else(|| Some(now())) } else { None };
+        let wont_do_at = if wont_do { cur.wont_do_at.clone().or_else(|| Some(now())) } else { None };
+        let kind = match &patch.kind {
+            Some(k) => check_kind(k)?,
+            None => cur.kind.clone(),
+        };
+        if kind != cur.kind {
+            let p = self.project_by_id(cur.project_id)?;
+            if let Some(fixed) = list_kind(&p.slug).filter(|f| *f != kind) {
+                return Err(Error::Invalid(format!("everything on {} is a {fixed}: move it to a project instead", p.name)));
+            }
+        }
         self.conn.execute(
-            "UPDATE tasks SET text = ?1, done = ?2, done_at = ?3 WHERE id = ?4",
-            params![text, done as i64, done_at, id],
+            "UPDATE tasks SET text = ?1, done = ?2, done_at = ?3, kind = ?4, wont_do_at = ?5 WHERE id = ?6",
+            params![text, done as i64, done_at, kind, wont_do_at, id],
         )?;
         self.touch(cur.project_id)?;
         self.task(id)
     }
 
-    /// Moves a task to the end of another project's checklist. Both projects count it as activity.
+    /// Moves a task or idea to the end of another project's list. It stays what it is, except that
+    /// on the to-do list it becomes a task and on the ideas list an idea. Both projects count it as activity.
     pub fn move_task(&self, id: i64, project_id: i64) -> Result<Task> {
         let cur = self.task(id)?;
-        self.project_by_id(project_id)?;
+        let to = self.project_by_id(project_id)?;
         if cur.project_id == project_id {
             return Ok(cur);
         }
+        if to.private != self.project_by_id(cur.project_id)?.private {
+            return Err(Error::Invalid("private things stay private: move it between private projects only".into()));
+        }
+        let kind = list_kind(&to.slug).unwrap_or(&cur.kind);
         let pos: i64 =
             self.conn.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM tasks WHERE project_id = ?1", [project_id], |r| r.get(0))?;
-        self.conn.execute("UPDATE tasks SET project_id = ?1, position = ?2 WHERE id = ?3", params![project_id, pos, id])?;
+        self.conn.execute(
+            "UPDATE tasks SET project_id = ?1, position = ?2, kind = ?3 WHERE id = ?4",
+            params![project_id, pos, kind, id],
+        )?;
         self.touch(cur.project_id)?;
         self.touch(project_id)?;
         self.task(id)
@@ -703,10 +925,23 @@ impl Db {
                     }
                     out.push('\n');
                 }
-                let tasks = self.tasks(p.id)?;
+                let items = self.tasks(p.id)?;
+                let (ideas, tasks): (Vec<_>, Vec<_>) = items.iter().partition(|t| t.kind == "idea" && p.slug != IDEAS_SLUG);
                 if !tasks.is_empty() {
                     for t in &tasks {
-                        out.push_str(&format!("- [{}] {}\n", if t.done { "x" } else { " " }, t.text));
+                        if t.wont_do {
+                            out.push_str(&format!("- [-] {} (won't do)\n", t.text));
+                        } else {
+                            out.push_str(&format!("- [{}] {}\n", if t.done { "x" } else { " " }, t.text));
+                        }
+                    }
+                    out.push('\n');
+                }
+                let ideas: Vec<_> = ideas.iter().filter(|t| !t.done && !t.wont_do).collect();
+                if !ideas.is_empty() {
+                    out.push_str("Ideas:\n");
+                    for t in ideas {
+                        out.push_str(&format!("- {}\n", t.text));
                     }
                     out.push('\n');
                 }
@@ -831,5 +1066,137 @@ mod tests {
         assert_eq!(db.move_task(t.id, p.id).unwrap().position, 2, "moving to the same place is a no-op");
         assert!(matches!(db.move_task(t.id, 9999), Err(Error::NotFound(_))));
         assert_eq!(db.move_task(t.id, ideas.id).unwrap().project_id, ideas.id);
+    }
+
+    #[test]
+    fn wont_do() {
+        let db = Db::memory().unwrap();
+        let p = db.create(new("Learn Blender", "personal"), "test").unwrap();
+        let t = db.add_task(p.id, "Model the mug").unwrap();
+        db.add_task(p.id, "Texture the mug").unwrap();
+        let i = db.add_idea(p.id, "Animate the mug").unwrap();
+        let wont = |v| TaskPatch { wont_do: Some(v), ..Default::default() };
+        let t = db.update_task(t.id, wont(true)).unwrap();
+        assert!(t.wont_do && t.wont_do_at.is_some() && !t.done);
+        db.update_task(i.id, wont(true)).unwrap();
+        let p2 = db.project_by_id(p.id).unwrap();
+        assert_eq!((p2.tasks_done, p2.tasks_total, p2.ideas_open), (0, 1, 0), "won't-do items aren't open or counted");
+        assert_eq!(db.open_items_everywhere("task").unwrap().len(), 1);
+        assert!(db.project_ideas().unwrap().is_empty());
+        assert!(db.export_markdown(3, "CatApp").unwrap().contains("- [-] Model the mug (won't do)"));
+        // Ticking it done clears won't-do; marking won't-do unticks it; false puts it back.
+        let t = db.update_task(t.id, TaskPatch { done: Some(true), ..Default::default() }).unwrap();
+        assert!(t.done && !t.wont_do);
+        let t = db.update_task(t.id, wont(true)).unwrap();
+        assert!(!t.done && t.wont_do && t.done_at.is_none());
+        let t = db.update_task(t.id, wont(false)).unwrap();
+        assert!(!t.done && !t.wont_do && t.wont_do_at.is_none());
+        assert!(db.update_task(t.id, TaskPatch { done: Some(true), wont_do: Some(true), ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn private_projects_are_hidden_without_show_private() {
+        // Two connections to one file, like the web app and an agent's MCP server.
+        let path = std::env::temp_dir().join(format!("catapp-private-{}.db", std::process::id()));
+        let web = Db::open(&path).unwrap().show_private();
+        let agent = Db::open(&path).unwrap();
+        let open = web.create(new("Learn Blender", "personal"), "test").unwrap();
+        let secret = NewProject { name: "enc1:AAAA".into(), private: true, ..Default::default() };
+        assert!(agent.create(secret.clone(), "test").is_err(), "only the web app makes private projects");
+        let p = web.create(secret, "test").unwrap();
+        assert!(p.private && p.slug == "private");
+        let n = web.add_note(p.id, "enc1:BBBB", "web").unwrap();
+        let t = web.add_task(p.id, "enc1:CCCC").unwrap();
+        web.add_idea(p.id, "enc1:DDDD").unwrap();
+        web.update(p.id, ProjectPatch { next_step: Some("enc1:EEEE".into()), ..Default::default() }, "web").unwrap();
+        assert_eq!(web.notes(p.id, 1).unwrap()[0].body, "enc1:EEEE", "no plain words around the encrypted next step");
+
+        assert_eq!(web.projects().unwrap().len(), 2);
+        assert_eq!(agent.projects().unwrap().len(), 1);
+        assert!(agent.find("private").is_err() && agent.find(&p.id.to_string()).is_err());
+        assert!(agent.project_by_id(p.id).is_err() && agent.add_note(p.id, "hi", "claude").is_err());
+        assert!(agent.note(n.id).is_err() && agent.edit_note(n.id, "x").is_err() && agent.delete_note(n.id).is_err());
+        assert!(agent.task(t.id).is_err() && agent.delete_task(t.id).is_err());
+        assert!(agent.update_task(t.id, TaskPatch { done: Some(true), ..Default::default() }).is_err());
+        assert!(agent.vault().is_err() && agent.set_vault(&serde_json::json!({})).is_err());
+        assert!(!agent.export_markdown(5, "CatApp").unwrap().contains("enc1:"));
+        for db in [&web, &agent] {
+            assert!(db.recent(50, None).unwrap().iter().all(|n| n.project_id != p.id), "never in recent notes");
+            let (ps, ns, ts) = db.search("enc1").unwrap();
+            assert!(ps.is_empty() && ns.is_empty() && ts.is_empty(), "never searched");
+            assert!(db.project_ideas().unwrap().is_empty());
+        }
+        assert_eq!(web.open_items_everywhere("task").unwrap().len(), 1);
+        assert!(agent.open_items_everywhere("task").unwrap().is_empty());
+        assert!(web.move_task(t.id, open.id).is_err(), "private things don't move out");
+        let o = web.add_task(open.id, "Model the mug").unwrap();
+        assert!(web.move_task(o.id, p.id).is_err(), "or in");
+
+        assert!(web.vault().unwrap().is_none());
+        web.set_vault(&serde_json::json!({ "salt": "s", "check": "c" })).unwrap();
+        assert_eq!(web.vault().unwrap().unwrap()["salt"], "s");
+        assert!(web.set_vault(&serde_json::json!({ "salt": "t", "check": "d" })).is_err(), "set once");
+        drop((web, agent));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
+    fn upgrade_makes_the_ideas_list_ideas() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'personal', status TEXT NOT NULL DEFAULT 'active', summary TEXT NOT NULL DEFAULT '',
+                next_step TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE notes (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'note',
+                body TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'web', created_at TEXT NOT NULL, edited_at TEXT);
+            CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, text TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL, created_at TEXT NOT NULL, done_at TEXT);
+            INSERT INTO projects VALUES (1, 'ideas', 'Ideas', 'personal', 'active', '', '', '', 'x', 'x');
+            INSERT INTO projects VALUES (2, 'learn-blender', 'Learn Blender', 'personal', 'active', '', '', '', 'x', 'x');
+            INSERT INTO tasks (project_id, text, position, created_at) VALUES (1, 'Learn to juggle', 1, 'x'), (2, 'Model the mug', 1, 'x');
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.tasks(1).unwrap()[0].kind, "idea");
+        assert_eq!(db.tasks(2).unwrap()[0].kind, "task");
+    }
+
+    #[test]
+    fn project_ideas() {
+        let db = Db::memory().unwrap();
+        let ideas = db.ensure_list(IDEAS_SLUG, "Sam", "test").unwrap();
+        let todo = db.ensure_list(TODO_SLUG, "Sam", "test").unwrap();
+        let p = db.create(new("Learn Blender", "personal"), "test").unwrap();
+        db.add_task(p.id, "Model the mug").unwrap();
+        let i = db.add_idea(p.id, "Animate the mug").unwrap();
+        assert_eq!(i.kind, "idea");
+        assert_eq!(db.add_task(ideas.id, "Learn to juggle").unwrap().kind, "idea", "the ideas list holds ideas");
+        let p = db.project_by_id(p.id).unwrap();
+        assert_eq!((p.tasks_total, p.ideas_open), (1, 1), "ideas aren't counted as tasks");
+        let d = db.detail(&p, 0).unwrap();
+        assert_eq!((d.tasks.len(), d.ideas.len()), (1, 1));
+        let elsewhere = db.project_ideas().unwrap();
+        assert_eq!(elsewhere.len(), 1, "the general list isn't included");
+        assert_eq!((elsewhere[0].project_slug.as_str(), elsewhere[0].item.text.as_str()), ("learn-blender", "Animate the mug"));
+        let all = db.open_items_everywhere("idea").unwrap();
+        assert_eq!((all.len(), all[0].project_slug.as_str()), (2, "ideas"), "the general list comes first");
+
+        // Moving: the general ideas list makes it an idea, the to-do list a task; projects keep it as it is.
+        assert_eq!(db.move_task(i.id, ideas.id).unwrap().kind, "idea");
+        assert_eq!(db.move_task(i.id, p.id).unwrap().kind, "idea");
+        assert_eq!(db.move_task(i.id, todo.id).unwrap().kind, "task");
+        assert_eq!(db.move_task(i.id, p.id).unwrap().kind, "task");
+
+        // Turning one into the other, except on the built-in lists.
+        let t = db.update_task(i.id, TaskPatch { kind: Some("Idea".into()), ..Default::default() }).unwrap();
+        assert_eq!(t.kind, "idea");
+        assert!(db.update_task(i.id, TaskPatch { kind: Some("thing".into()), ..Default::default() }).is_err());
+        let j = db.add_task(ideas.id, "Write a novel").unwrap();
+        assert!(db.update_task(j.id, TaskPatch { kind: Some("task".into()), ..Default::default() }).is_err());
+        let md = db.export_markdown(3, "CatApp").unwrap();
+        assert!(md.contains("Ideas:\n- Animate the mug") && md.contains("- [ ] Write a novel"));
     }
 }
