@@ -4,6 +4,7 @@
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -80,6 +81,8 @@ pub struct Project {
     pub tasks_total: i64,
     /// Ideas not yet ticked off.
     pub ideas_open: i64,
+    /// Encrypted in the browser and hidden from everything but the web app (see `Db::show_private`).
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,14 +124,15 @@ pub struct ProjectDetail {
     pub notes: Vec<Note>,
 }
 
-/// An idea on a project's own ideas list, with the project it's on.
+/// A task or idea with the project it's on, for the pages that gather them from every project.
 #[derive(Debug, Clone, Serialize)]
-pub struct ProjectIdea {
+pub struct ProjectItem {
     #[serde(flatten)]
-    pub idea: Task,
+    pub item: Task,
     pub project_slug: String,
     pub project_name: String,
     pub project_status: String,
+    pub project_private: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -144,6 +148,9 @@ pub struct NewProject {
     pub next_step: Option<String>,
     #[serde(default)]
     pub links: Option<String>,
+    /// Its text comes already encrypted (only the web app makes these).
+    #[serde(default)]
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -179,7 +186,8 @@ const PROJECT_SELECT: &str = "SELECT p.id, p.slug, p.name, p.category, p.status,
     (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id AND n.kind = 'note'),
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task' AND t.done = 1),
     (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task'),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'idea' AND t.done = 0)
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'idea' AND t.done = 0),
+    p.private
     FROM projects p";
 
 const NOTE_SELECT: &str = "SELECT n.id, n.project_id, p.slug, p.name, p.category, n.kind, n.body, n.source,
@@ -207,6 +215,7 @@ fn project_row(r: &Row) -> rusqlite::Result<Project> {
         tasks_done: r.get(12)?,
         tasks_total: r.get(13)?,
         ideas_open: r.get(14)?,
+        private: r.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -303,6 +312,9 @@ fn non_empty(s: &str, what: &str) -> Result<String> {
 
 pub struct Db {
     conn: Connection,
+    /// Whether private projects exist as far as callers can tell. Only the web app turns this on: to
+    /// the CLI, MCP and the assistant they're simply not there. Their text is encrypted either way.
+    private: bool,
 }
 
 impl Db {
@@ -367,7 +379,55 @@ impl Db {
                 COMMIT;"
             ))?;
         }
-        Ok(Db { conn })
+        if version < 3 {
+            // Private projects, and somewhere to keep the salt and check value for their passphrase.
+            conn.execute_batch(
+                "BEGIN;
+                ALTER TABLE projects ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                PRAGMA user_version = 3;
+                COMMIT;",
+            )?;
+        }
+        Ok(Db { conn, private: false })
+    }
+
+    /// Lets this connection see private projects. For the web app only.
+    pub fn show_private(mut self) -> Db {
+        self.private = true;
+        self
+    }
+
+    fn hidden(&self, p: &Project) -> bool {
+        p.private && !self.private
+    }
+
+    // ---- private projects ------------------------------------------------------------
+
+    /// The passphrase's salt and check value, as the browser stored them, if one has been set.
+    pub fn vault(&self) -> Result<Option<Value>> {
+        self.require_private()?;
+        let v: Option<String> = self.conn.query_row("SELECT value FROM settings WHERE key = 'vault'", [], |r| r.get(0)).optional()?;
+        Ok(v.and_then(|v| serde_json::from_str(&v).ok()))
+    }
+
+    /// Stores the passphrase's salt and check value. Only once: changing the passphrase would mean
+    /// re-encrypting everything.
+    pub fn set_vault(&self, v: &Value) -> Result<()> {
+        self.require_private()?;
+        if self.vault()?.is_some() {
+            return Err(Error::Invalid("the passphrase is already set".into()));
+        }
+        self.conn.execute("INSERT INTO settings (key, value) VALUES ('vault', ?1)", [v.to_string()])?;
+        Ok(())
+    }
+
+    fn require_private(&self) -> Result<()> {
+        if self.private {
+            Ok(())
+        } else {
+            Err(Error::NotFound("private projects are only in the web app".into()))
+        }
     }
 
     // ---- projects ------------------------------------------------------------------
@@ -376,13 +436,14 @@ impl Db {
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut st = self.conn.prepare(&format!("{PROJECT_SELECT} ORDER BY 11 DESC"))?;
         let rows = st.query_map([], project_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok(rows.into_iter().filter(|p| !self.hidden(p)).collect())
     }
 
     pub fn project_by_id(&self, id: i64) -> Result<Project> {
         self.conn
             .query_row(&format!("{PROJECT_SELECT} WHERE p.id = ?1"), [id], project_row)
             .optional()?
+            .filter(|p| !self.hidden(p))
             .ok_or_else(|| Error::NotFound(format!("no project with id {id}")))
     }
 
@@ -475,7 +536,11 @@ impl Db {
         let name = non_empty(&p.name, "name")?;
         let category = norm_category(p.category.as_deref().unwrap_or(""));
         let status = check_status(p.status.as_deref().unwrap_or("active"))?;
-        let base = slugify(&name);
+        if p.private {
+            self.require_private()?;
+        }
+        // A private project's name is encrypted, so its slug can't come from it.
+        let base = if p.private { "private".into() } else { slugify(&name) };
         let mut slug = base.clone();
         let mut n = 2;
         while self.conn.query_row("SELECT 1 FROM projects WHERE slug = ?1", [&slug], |_| Ok(())).optional()?.is_some() {
@@ -484,8 +549,8 @@ impl Db {
         }
         let t = now();
         self.conn.execute(
-            "INSERT INTO projects (slug, name, category, status, summary, next_step, links, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            "INSERT INTO projects (slug, name, category, status, summary, next_step, links, created_at, updated_at, private)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
             params![
                 slug,
                 name,
@@ -494,7 +559,8 @@ impl Db {
                 p.summary.unwrap_or_default().trim(),
                 p.next_step.unwrap_or_default().trim(),
                 p.links.unwrap_or_default().trim(),
-                t
+                t,
+                p.private as i64
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -527,7 +593,9 @@ impl Db {
             self.add_entry(id, "status", &format!("Status: {} → {}", cur.status, status), source)?;
         }
         if next_step != cur.next_step && !next_step.is_empty() {
-            self.add_entry(id, "next", &format!("Next step: {next_step}"), source)?;
+            // A private project's next step is encrypted, so its entry is just that; the app adds the words.
+            let body = if cur.private { next_step.clone() } else { format!("Next step: {next_step}") };
+            self.add_entry(id, "next", &body, source)?;
         }
         self.project_by_id(id)
     }
@@ -571,7 +639,7 @@ impl Db {
 
     pub fn note(&self, id: i64) -> Result<Note> {
         self.conn
-            .query_row(&format!("{NOTE_SELECT} WHERE n.id = ?1"), [id], note_row)
+            .query_row(&format!("{NOTE_SELECT} WHERE n.id = ?1 AND (?2 OR p.private = 0)"), params![id, self.private], note_row)
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("no note with id {id}")))
     }
@@ -587,6 +655,7 @@ impl Db {
 
     pub fn edit_note(&self, id: i64, body: &str) -> Result<Note> {
         let body = non_empty(body, "a note")?;
+        self.note(id)?;
         let n = self.conn.execute("UPDATE notes SET body = ?1, edited_at = ?2 WHERE id = ?3", params![body, now(), id])?;
         if n == 0 {
             return Err(Error::NotFound(format!("no note with id {id}")));
@@ -595,36 +664,42 @@ impl Db {
     }
 
     pub fn delete_note(&self, id: i64) -> Result<()> {
+        self.note(id)?;
         if self.conn.execute("DELETE FROM notes WHERE id = ?1", [id])? == 0 {
             return Err(Error::NotFound(format!("no note with id {id}")));
         }
         Ok(())
     }
 
-    /// Recent notes across projects (written notes only, not status changes).
+    /// Recent notes across projects (written notes only, not status changes). Never private ones.
     pub fn recent(&self, limit: usize, category: Option<&str>) -> Result<Vec<Note>> {
         let mut st = self.conn.prepare(&format!(
-            "{NOTE_SELECT} WHERE n.kind = 'note' AND (?1 IS NULL OR p.category = ?1)
+            "{NOTE_SELECT} WHERE n.kind = 'note' AND p.private = 0 AND (?1 IS NULL OR p.category = ?1)
              ORDER BY n.created_at DESC, n.id DESC LIMIT ?2"
         ))?;
         let rows = st.query_map(params![category, limit as i64], note_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    /// Notes, projects and tasks containing the text (case-insensitive).
+    /// Notes, projects and tasks containing the text (case-insensitive). Private projects are
+    /// encrypted, so they're never searched.
     pub fn search(&self, q: &str) -> Result<(Vec<Project>, Vec<Note>, Vec<Task>)> {
         let q = non_empty(q, "a search")?.to_lowercase();
         let projects = self
             .projects()?
             .into_iter()
+            .filter(|p| !p.private)
             .filter(|p| [&p.name, &p.summary, &p.next_step, &p.links].iter().any(|s| s.to_lowercase().contains(&q)))
             .collect();
         let pat = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         let mut st = self.conn.prepare(&format!(
-            "{NOTE_SELECT} WHERE lower(n.body) LIKE ?1 ESCAPE '\\' ORDER BY n.created_at DESC LIMIT 50"
+            "{NOTE_SELECT} WHERE lower(n.body) LIKE ?1 ESCAPE '\\' AND p.private = 0 ORDER BY n.created_at DESC LIMIT 50"
         ))?;
         let notes = st.query_map([&pat], note_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut st = self.conn.prepare(&format!("{TASK_SELECT} WHERE lower(text) LIKE ?1 ESCAPE '\\' LIMIT 50"))?;
+        let mut st = self.conn.prepare(&format!(
+            "{TASK_SELECT} WHERE lower(text) LIKE ?1 ESCAPE '\\'
+             AND project_id IN (SELECT id FROM projects WHERE private = 0) LIMIT 50"
+        ))?;
         let tasks = st.query_map([&pat], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((projects, notes, tasks))
     }
@@ -644,16 +719,32 @@ impl Db {
     }
 
     /// Open ideas on projects' own ideas lists (not the general one), most recently active project first.
-    pub fn project_ideas(&self) -> Result<Vec<ProjectIdea>> {
+    pub fn project_ideas(&self) -> Result<Vec<ProjectItem>> {
+        Ok(self.open_items("idea", false)?.into_iter().filter(|i| i.project_slug != IDEAS_SLUG).collect())
+    }
+
+    /// Every open task or idea (`kind`): the to-do or ideas list's first, then each project's, most
+    /// recently active first. Private projects' too, for the web app.
+    pub fn open_items_everywhere(&self, kind: &str) -> Result<Vec<ProjectItem>> {
+        self.open_items(&check_kind(kind)?, self.private)
+    }
+
+    fn open_items(&self, kind: &str, private: bool) -> Result<Vec<ProjectItem>> {
         let mut st = self.conn.prepare(
-            "SELECT t.id, t.project_id, t.kind, t.text, t.done, t.position, t.created_at, t.done_at, p.slug, p.name, p.status
+            "SELECT t.id, t.project_id, t.kind, t.text, t.done, t.position, t.created_at, t.done_at, p.slug, p.name, p.status, p.private
              FROM tasks t JOIN projects p ON p.id = t.project_id
-             WHERE t.kind = 'idea' AND t.done = 0 AND p.slug != ?1
-             ORDER BY p.updated_at DESC, p.id, t.position, t.id",
+             WHERE t.kind = ?1 AND t.done = 0 AND (?2 OR p.private = 0)
+             ORDER BY p.slug IN (?3, ?4) DESC, p.updated_at DESC, p.id, t.position, t.id",
         )?;
         let rows = st
-            .query_map([IDEAS_SLUG], |r| {
-                Ok(ProjectIdea { idea: task_row(r)?, project_slug: r.get(8)?, project_name: r.get(9)?, project_status: r.get(10)? })
+            .query_map(params![kind, private, TODO_SLUG, IDEAS_SLUG], |r| {
+                Ok(ProjectItem {
+                    item: task_row(r)?,
+                    project_slug: r.get(8)?,
+                    project_name: r.get(9)?,
+                    project_status: r.get(10)?,
+                    project_private: r.get::<_, i64>(11)? != 0,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -661,7 +752,11 @@ impl Db {
 
     pub fn task(&self, id: i64) -> Result<Task> {
         self.conn
-            .query_row(&format!("{TASK_SELECT} WHERE id = ?1"), [id], task_row)
+            .query_row(
+                &format!("{TASK_SELECT} WHERE id = ?1 AND (?2 OR project_id IN (SELECT id FROM projects WHERE private = 0))"),
+                params![id, self.private],
+                task_row,
+            )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("no task with id {id}")))
     }
@@ -723,6 +818,9 @@ impl Db {
         let to = self.project_by_id(project_id)?;
         if cur.project_id == project_id {
             return Ok(cur);
+        }
+        if to.private != self.project_by_id(cur.project_id)?.private {
+            return Err(Error::Invalid("private things stay private: move it between private projects only".into()));
         }
         let kind = list_kind(&to.slug).unwrap_or(&cur.kind);
         let pos: i64 =
@@ -944,6 +1042,54 @@ mod tests {
     }
 
     #[test]
+    fn private_projects_are_hidden_without_show_private() {
+        // Two connections to one file, like the web app and an agent's MCP server.
+        let path = std::env::temp_dir().join(format!("catapp-private-{}.db", std::process::id()));
+        let web = Db::open(&path).unwrap().show_private();
+        let agent = Db::open(&path).unwrap();
+        let open = web.create(new("Learn Blender", "personal"), "test").unwrap();
+        let secret = NewProject { name: "enc1:AAAA".into(), private: true, ..Default::default() };
+        assert!(agent.create(secret.clone(), "test").is_err(), "only the web app makes private projects");
+        let p = web.create(secret, "test").unwrap();
+        assert!(p.private && p.slug == "private");
+        let n = web.add_note(p.id, "enc1:BBBB", "web").unwrap();
+        let t = web.add_task(p.id, "enc1:CCCC").unwrap();
+        web.add_idea(p.id, "enc1:DDDD").unwrap();
+        web.update(p.id, ProjectPatch { next_step: Some("enc1:EEEE".into()), ..Default::default() }, "web").unwrap();
+        assert_eq!(web.notes(p.id, 1).unwrap()[0].body, "enc1:EEEE", "no plain words around the encrypted next step");
+
+        assert_eq!(web.projects().unwrap().len(), 2);
+        assert_eq!(agent.projects().unwrap().len(), 1);
+        assert!(agent.find("private").is_err() && agent.find(&p.id.to_string()).is_err());
+        assert!(agent.project_by_id(p.id).is_err() && agent.add_note(p.id, "hi", "claude").is_err());
+        assert!(agent.note(n.id).is_err() && agent.edit_note(n.id, "x").is_err() && agent.delete_note(n.id).is_err());
+        assert!(agent.task(t.id).is_err() && agent.delete_task(t.id).is_err());
+        assert!(agent.update_task(t.id, TaskPatch { done: Some(true), ..Default::default() }).is_err());
+        assert!(agent.vault().is_err() && agent.set_vault(&serde_json::json!({})).is_err());
+        assert!(!agent.export_markdown(5, "CatApp").unwrap().contains("enc1:"));
+        for db in [&web, &agent] {
+            assert!(db.recent(50, None).unwrap().iter().all(|n| n.project_id != p.id), "never in recent notes");
+            let (ps, ns, ts) = db.search("enc1").unwrap();
+            assert!(ps.is_empty() && ns.is_empty() && ts.is_empty(), "never searched");
+            assert!(db.project_ideas().unwrap().is_empty());
+        }
+        assert_eq!(web.open_items_everywhere("task").unwrap().len(), 1);
+        assert!(agent.open_items_everywhere("task").unwrap().is_empty());
+        assert!(web.move_task(t.id, open.id).is_err(), "private things don't move out");
+        let o = web.add_task(open.id, "Model the mug").unwrap();
+        assert!(web.move_task(o.id, p.id).is_err(), "or in");
+
+        assert!(web.vault().unwrap().is_none());
+        web.set_vault(&serde_json::json!({ "salt": "s", "check": "c" })).unwrap();
+        assert_eq!(web.vault().unwrap().unwrap()["salt"], "s");
+        assert!(web.set_vault(&serde_json::json!({ "salt": "t", "check": "d" })).is_err(), "set once");
+        drop((web, agent));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    #[test]
     fn upgrade_makes_the_ideas_list_ideas() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -981,7 +1127,9 @@ mod tests {
         assert_eq!((d.tasks.len(), d.ideas.len()), (1, 1));
         let elsewhere = db.project_ideas().unwrap();
         assert_eq!(elsewhere.len(), 1, "the general list isn't included");
-        assert_eq!((elsewhere[0].project_slug.as_str(), elsewhere[0].idea.text.as_str()), ("learn-blender", "Animate the mug"));
+        assert_eq!((elsewhere[0].project_slug.as_str(), elsewhere[0].item.text.as_str()), ("learn-blender", "Animate the mug"));
+        let all = db.open_items_everywhere("idea").unwrap();
+        assert_eq!((all.len(), all[0].project_slug.as_str()), (2, "ideas"), "the general list comes first");
 
         // Moving: the general ideas list makes it an idea, the to-do list a task; projects keep it as it is.
         assert_eq!(db.move_task(i.id, ideas.id).unwrap().kind, "idea");

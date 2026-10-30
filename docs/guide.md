@@ -58,6 +58,17 @@ catapp task mv 76 blender    # move it to a project (or to todo, ideas)
 
 To move a task in the app, press the arrow next to it (on a project page or in the home-page lists; on desktop it shows when you hover) and pick where it goes. Type to filter; finished projects only show up when you search for them.
 
+To see everything at once, follow "+ N in projects" under either list (or go to `#/todos`): every open task, the to-do list first and then a panel per project, across the full width. The Ideas tab does the same for ideas.
+
+## Private projects
+
+Tick **Private** when making a project to keep it from agents. Its name, summary, next step, links, notes, tasks and ideas are encrypted in your browser with a passphrase before they're saved (AES-GCM, with the key made from the passphrase by PBKDF2), so the database only holds scrambled text. The CLI, MCP and the assistant act as if private projects don't exist, and agents are told not to go looking. They never appear in recent notes or search.
+
+- You set the passphrase the first time you make a private project. It can't be changed or recovered: forget it and private projects can't be read.
+- Unlock once per visit (the Private section on the home page, or the project itself); reloading or pressing Lock locks them again.
+- Browsers only allow the encryption on `localhost` or over HTTPS, so on a phone over plain `http://` private projects stay locked.
+- A project is private from the start: an existing one can't be made private (make a new one), and tasks can only move between private projects.
+
 ## Assistant
 
 The **Ask** button (top bar on desktop, floating button on phones; or open `/#/ask`) is a chat with Claude that can only touch this app: "add a to-do to book the dentist", "add a project for learning Blender", "what's next on my projects?". Follow-up messages continue the same conversation; **New chat** starts afresh.

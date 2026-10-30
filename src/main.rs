@@ -306,7 +306,7 @@ fn list_cmd(slug: &str, text: Vec<String>, all: bool, empty: &str) -> Result<(),
                 println!("\n{} ({}):", i.project_name, i.project_slug);
                 last = i.project_slug.clone();
             }
-            println!("  [ ] {}  (#{})", i.idea.text, i.idea.id);
+            println!("  [ ] {}  (#{})", i.item.text, i.item.id);
         }
     }
     Ok(())
@@ -346,7 +346,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::Serve { port, bind } => {
             let port = port.unwrap_or(brand::Brand::load(&home()).port);
             let state = Arc::new(web::AppState {
-                db: Mutex::new(open_db()?),
+                db: Mutex::new(open_db()?.show_private()),
                 token: token()?,
                 home: home(),
                 assistant: tokio::sync::Mutex::new(()),
@@ -457,7 +457,7 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::New { name, category, status, summary, next, links } => {
             let p = open_db()?
-                .create(NewProject { name, category: Some(category), status: Some(status), summary, next_step: next, links }, "cli")
+                .create(NewProject { name, category: Some(category), status: Some(status), summary, next_step: next, links, ..Default::default() }, "cli")
                 .map_err(e)?;
             println!("Created {} ({}, {})", p.name, p.slug, p.category);
         }

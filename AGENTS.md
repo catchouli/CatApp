@@ -8,6 +8,8 @@ The person running this app keeps their real life in it: personal projects, work
 - **Don't test against the running app** on the usual port (8787). It's the live copy.
 - **Never put real data into the repo**: no project names, tasks, notes or people from anyone's database in code, test fixtures, screenshots, commit messages, PR titles or descriptions, or issues. Use made-up examples ("Learn Blender", "Book the dentist").
 
+**Private projects** are encrypted in the browser and hidden from the CLI, MCP and the assistant on purpose (`Db::show_private` is for the web app only). Keep it that way: don't add paths that hand their rows to anything but the web app, and never try to read or decrypt anyone's.
+
 The MCP tools you may have for this app (`catapp`, `maisyapp`, ...) are the owner's real organiser too. Use them for what the owner asks (like posting a status note), never as test data.
 
 ## Testing with made-up data

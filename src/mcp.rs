@@ -21,7 +21,10 @@ aren't tasks. Put a task on the project it belongs to (the one you're working in
 general to-do list, the project 'todo', is only for things that don't belong to any project. Each project also has \
 its own ideas list (things to maybe do some day): add one with add_task and `idea` true. {owner}'s general ideas list, \
 the project 'ideas', is for ideas that don't belong to a project. To move a task or idea to another project or list, \
-use update_task with `project`; `idea` turns a task into an idea or back."
+use update_task with `project`; `idea` turns a task into an idea or back. \
+{owner} keeps some projects private: they're encrypted and deliberately left out of these tools. Never try to get \
+at them another way (the database file, the web app or its API, backups); if {owner} asks about one, say it's \
+private and only in the web app."
     )
 }
 
@@ -198,6 +201,7 @@ fn call(db: &Db, owner: &str, name: &str, a: &Value) -> Result<Value, String> {
                 summary: owned(a, "summary"),
                 next_step: owned(a, "next_step"),
                 links: owned(a, "links"),
+                ..Default::default()
             };
             v(&db.create(np, "claude").map_err(e)?)
         }

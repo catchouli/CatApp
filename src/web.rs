@@ -68,6 +68,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{slug}/tasks", post(add_task))
         .route("/api/projects/{slug}/ideas", post(add_idea))
         .route("/api/ideas", get(project_ideas))
+        .route("/api/tasks", get(open_tasks))
+        .route("/api/private", get(get_vault).put(set_vault))
         .route("/api/notes/{id}", patch(edit_note).delete(delete_note))
         .route("/api/tasks/{id}", patch(update_task).delete(delete_task))
         .route("/api/tasks/{id}/move", post(move_task))
@@ -274,6 +276,30 @@ async fn add_idea(State(st): St, Path(slug): Path<String>, Json(b): Json<TaskBod
 
 async fn project_ideas(State(st): St) -> R {
     ok(st.db.lock().unwrap().project_ideas()?)
+}
+
+#[derive(Deserialize)]
+struct KindQ {
+    kind: Option<String>,
+}
+
+/// Every open task (or idea, with ?kind=idea), for the overview page.
+async fn open_tasks(State(st): St, Query(q): Query<KindQ>) -> R {
+    ok(st.db.lock().unwrap().open_items_everywhere(q.kind.as_deref().unwrap_or("task"))?)
+}
+
+/// The salt and check value for the private projects' passphrase (null until one is set). The
+/// passphrase itself never leaves the browser.
+async fn get_vault(State(st): St) -> R {
+    ok(st.db.lock().unwrap().vault()?)
+}
+
+async fn set_vault(State(st): St, Json(v): Json<Value>) -> R {
+    if !["salt", "check"].iter().all(|k| v.get(k).is_some_and(Value::is_string)) {
+        return Err(db::Error::Invalid("needs salt and check".into()).into());
+    }
+    st.db.lock().unwrap().set_vault(&v)?;
+    ok(json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]

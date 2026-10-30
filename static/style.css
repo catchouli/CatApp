@@ -323,3 +323,22 @@ body.voice-avatar .ask { height: min(820px, calc(100vh - 100px)); }
   .top .btn.primary { padding: 0 10px; font-size: 14px; }
   .proj-head h1 { font-size: 22px; }
 }
+
+/* ---- private projects ---- */
+.private-title { display: flex; align-items: center; gap: 6px; }
+.private-title button { margin-left: auto; text-transform: none; letter-spacing: 0; }
+.private-mark { color: var(--muted); }
+.locked { text-align: center; padding: 32px 16px; }
+.locked p { color: var(--muted); margin-bottom: 12px; }
+.unlock input { margin-bottom: 8px; }
+.unlock .err { color: var(--danger); margin: 0 0 8px; }
+label.check { display: flex; gap: 8px; align-items: baseline; margin-bottom: 14px; font-weight: 500; }
+label.check input { width: auto; }
+
+/* ---- everything to do: full width, a grid of panels read left to right, so it stays short ---- */
+main:has(.all-todos) { max-width: 1680px; }
+.all-todos { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); align-items: start; }
+.all-todos .panel + .panel { margin-top: 0; }
+.all-todos .tasks { margin: 0; }
+.all-todos h2 a { color: inherit; }
+a.chip { display: inline-flex; align-items: center; text-decoration: none; border: 1px solid var(--border); }
