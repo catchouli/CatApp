@@ -18,8 +18,10 @@ with your agent name as `source`, and update the next step if it changed. Don't 
 Tasks for {owner}: add one only when {owner} asks, or for something that genuinely needs {owner} after the session \
 and only after asking {owner} first; questions and decisions you can settle by asking {owner} in the conversation \
 aren't tasks. Put a task on the project it belongs to (the one you're working in, or the one it's about); the \
-general to-do list, the project 'todo', is only for things that don't belong to any project. {owner}'s ideas list is the project \
-'ideas' (things to maybe do some day). To move a task to another project or list, use update_task with `project`."
+general to-do list, the project 'todo', is only for things that don't belong to any project. Each project also has \
+its own ideas list (things to maybe do some day): add one with add_task and `idea` true. {owner}'s general ideas list, \
+the project 'ideas', is for ideas that don't belong to a project. To move a task or idea to another project or list, \
+use update_task with `project`; `idea` turns a task into an idea or back."
     )
 }
 
@@ -37,7 +39,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_project",
-            "description": "One project in full: details, tasks, and its log (newest first).",
+            "description": "One project in full: details, tasks, ideas, and its log (newest first).",
             "inputSchema": { "type": "object", "required": ["project"], "properties": {
                 "project": project,
                 "notes_limit": { "type": "integer", "description": "How many log entries (default 20, 0 for all)" }
@@ -78,17 +80,19 @@ fn tools() -> Value {
         },
         {
             "name": "add_task",
-            "description": "Add a checklist item to a project. Prefer the project the task belongs to over the general to-do list ('todo').",
+            "description": "Add a task to a project's checklist, or with idea true, an idea to its ideas list. Prefer the project it belongs to over the general to-do list ('todo') and ideas list ('ideas').",
             "inputSchema": { "type": "object", "required": ["project", "text"], "properties": {
-                "project": project, "text": { "type": "string" }
+                "project": project, "text": { "type": "string" },
+                "idea": { "type": "boolean", "description": "Add it as an idea (something to maybe do some day), not a task" }
             }}
         },
         {
             "name": "update_task",
-            "description": "Tick or untick a task, change its text, or move it to another project (e.g. from 'todo' to a project, or to 'ideas'). Task ids come from get_project.",
+            "description": "Tick or untick a task or idea, change its text, turn it into an idea or back, or move it to another project (e.g. from 'todo' to a project, or to 'ideas'). Ids come from get_project.",
             "inputSchema": { "type": "object", "required": ["task_id"], "properties": {
                 "task_id": { "type": "integer" }, "done": { "type": "boolean" }, "text": { "type": "string" },
-                "project": { "type": "string", "description": "Move the task to the end of this project's checklist" }
+                "idea": { "type": "boolean", "description": "true makes it an idea, false a task" },
+                "project": { "type": "string", "description": "Move it to the end of this project's list. It stays a task or idea, except that 'todo' makes it a task and 'ideas' an idea" }
             }}
         },
         {
@@ -131,8 +135,8 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("add_note", &["project", "text", "source"]),
     ("update_project", &["project", "name", "category", "status", "summary", "next_step", "links", "source"]),
     ("create_project", &["name", "category", "status", "summary", "next_step", "links"]),
-    ("add_task", &["project", "text"]),
-    ("update_task", &["task_id", "done", "text", "project"]),
+    ("add_task", &["project", "text", "idea"]),
+    ("update_task", &["task_id", "done", "text", "idea", "project"]),
     ("recent_notes", &["limit", "category"]),
     ("search", &["query"]),
 ];
@@ -158,7 +162,7 @@ fn call(db: &Db, owner: &str, name: &str, a: &Value) -> Result<Value, String> {
                 .map(|p| {
                     json!({
                         "slug": p.slug, "name": p.name, "category": p.category, "status": p.status,
-                        "next_step": p.next_step, "tasks": format!("{}/{}", p.tasks_done, p.tasks_total),
+                        "next_step": p.next_step, "tasks": format!("{}/{}", p.tasks_done, p.tasks_total), "ideas": p.ideas_open,
                         "notes": p.note_count, "last_activity": p.last_activity
                     })
                 })
@@ -199,7 +203,9 @@ fn call(db: &Db, owner: &str, name: &str, a: &Value) -> Result<Value, String> {
         }
         "add_task" => {
             let p = db.find_or_list(need(a, "project")?, owner, "claude").map_err(e)?;
-            v(&db.add_task(p.id, need(a, "text")?).map_err(e)?)
+            let text = need(a, "text")?;
+            let item = if a.get("idea").and_then(Value::as_bool) == Some(true) { db.add_idea(p.id, text) } else { db.add_task(p.id, text) };
+            v(&item.map_err(e)?)
         }
         "update_task" => {
             let id = a.get("task_id").and_then(Value::as_i64).ok_or("missing 'task_id'")?;
@@ -207,7 +213,8 @@ fn call(db: &Db, owner: &str, name: &str, a: &Value) -> Result<Value, String> {
                 let p = db.find_or_list(to, owner, "claude").map_err(e)?;
                 db.move_task(id, p.id).map_err(e)?;
             }
-            let patch = TaskPatch { text: owned(a, "text"), done: a.get("done").and_then(Value::as_bool) };
+            let kind = a.get("idea").and_then(Value::as_bool).map(|i| if i { "idea" } else { "task" }.to_string());
+            let patch = TaskPatch { text: owned(a, "text"), done: a.get("done").and_then(Value::as_bool), kind };
             v(&db.update_task(id, patch).map_err(e)?)
         }
         "recent_notes" => {

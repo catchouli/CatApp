@@ -78,6 +78,8 @@ pub struct Project {
     pub note_count: i64,
     pub tasks_done: i64,
     pub tasks_total: i64,
+    /// Ideas not yet ticked off.
+    pub ideas_open: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +103,8 @@ pub struct Note {
 pub struct Task {
     pub id: i64,
     pub project_id: i64,
+    /// "task" for the checklist, "idea" for things to maybe do some day.
+    pub kind: String,
     pub text: String,
     pub done: bool,
     pub position: i64,
@@ -113,7 +117,18 @@ pub struct ProjectDetail {
     #[serde(flatten)]
     pub project: Project,
     pub tasks: Vec<Task>,
+    pub ideas: Vec<Task>,
     pub notes: Vec<Note>,
+}
+
+/// An idea on a project's own ideas list, with the project it's on.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectIdea {
+    #[serde(flatten)]
+    pub idea: Task,
+    pub project_slug: String,
+    pub project_name: String,
+    pub project_status: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -153,20 +168,27 @@ pub struct TaskPatch {
     pub text: Option<String>,
     #[serde(default)]
     pub done: Option<bool>,
+    /// "task" or "idea": turns one into the other.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 const PROJECT_SELECT: &str = "SELECT p.id, p.slug, p.name, p.category, p.status, p.summary, p.next_step, p.links,
     p.created_at, p.updated_at,
     MAX(p.updated_at, COALESCE((SELECT MAX(n.created_at) FROM notes n WHERE n.project_id = p.id), '')),
     (SELECT COUNT(*) FROM notes n WHERE n.project_id = p.id AND n.kind = 'note'),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.done = 1),
-    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id)
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task' AND t.done = 1),
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'task'),
+    (SELECT COUNT(*) FROM tasks t WHERE t.project_id = p.id AND t.kind = 'idea' AND t.done = 0)
     FROM projects p";
 
 const NOTE_SELECT: &str = "SELECT n.id, n.project_id, p.slug, p.name, p.category, n.kind, n.body, n.source,
     n.created_at, n.edited_at FROM notes n JOIN projects p ON p.id = n.project_id";
 
-const TASK_SELECT: &str = "SELECT id, project_id, text, done, position, created_at, done_at FROM tasks";
+const TASK_SELECT: &str = "SELECT id, project_id, kind, text, done, position, created_at, done_at FROM tasks";
+
+/// What a checklist item can be.
+pub const KINDS: &[&str] = &["task", "idea"];
 
 fn project_row(r: &Row) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -184,6 +206,7 @@ fn project_row(r: &Row) -> rusqlite::Result<Project> {
         note_count: r.get(11)?,
         tasks_done: r.get(12)?,
         tasks_total: r.get(13)?,
+        ideas_open: r.get(14)?,
     })
 }
 
@@ -206,11 +229,12 @@ fn task_row(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
         project_id: r.get(1)?,
-        text: r.get(2)?,
-        done: r.get::<_, i64>(3)? != 0,
-        position: r.get(4)?,
-        created_at: r.get(5)?,
-        done_at: r.get(6)?,
+        kind: r.get(2)?,
+        text: r.get(3)?,
+        done: r.get::<_, i64>(4)? != 0,
+        position: r.get(5)?,
+        created_at: r.get(6)?,
+        done_at: r.get(7)?,
     })
 }
 
@@ -247,6 +271,24 @@ fn check_status(s: &str) -> Result<String> {
         Ok(s)
     } else {
         Err(Error::Invalid(format!("unknown status '{s}': use one of {}", STATUSES.join(", "))))
+    }
+}
+
+fn check_kind(k: &str) -> Result<String> {
+    let k = k.trim().to_lowercase();
+    if KINDS.contains(&k.as_str()) {
+        Ok(k)
+    } else {
+        Err(Error::Invalid(format!("unknown kind '{k}': use task or idea")))
+    }
+}
+
+/// What everything on a built-in list is: tasks on the to-do list, ideas on the ideas list.
+fn list_kind(slug: &str) -> Option<&'static str> {
+    match slug {
+        TODO_SLUG => Some("task"),
+        IDEAS_SLUG => Some("idea"),
+        _ => None,
     }
 }
 
@@ -314,6 +356,16 @@ impl Db {
                 );
                 PRAGMA user_version = 1;",
             )?;
+        }
+        if version < 2 {
+            // Checklist items become tasks or ideas; the ideas list's items are ideas.
+            conn.execute_batch(&format!(
+                "BEGIN;
+                ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
+                UPDATE tasks SET kind = 'idea' WHERE project_id IN (SELECT id FROM projects WHERE slug = '{IDEAS_SLUG}');
+                PRAGMA user_version = 2;
+                COMMIT;"
+            ))?;
         }
         Ok(Db { conn })
     }
@@ -413,7 +465,8 @@ impl Db {
     pub fn detail(&self, project: &Project, notes_limit: usize) -> Result<ProjectDetail> {
         Ok(ProjectDetail {
             project: project.clone(),
-            tasks: self.tasks(project.id)?,
+            tasks: self.items(project.id, "task")?,
+            ideas: self.items(project.id, "idea")?,
             notes: self.notes(project.id, notes_limit)?,
         })
     }
@@ -578,9 +631,31 @@ impl Db {
 
     // ---- tasks ---------------------------------------------------------------------
 
+    /// A project's tasks and ideas, in checklist order.
     pub fn tasks(&self, project_id: i64) -> Result<Vec<Task>> {
         let mut st = self.conn.prepare(&format!("{TASK_SELECT} WHERE project_id = ?1 ORDER BY position, id"))?;
         let rows = st.query_map([project_id], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Just a project's tasks, or just its ideas.
+    pub fn items(&self, project_id: i64, kind: &str) -> Result<Vec<Task>> {
+        Ok(self.tasks(project_id)?.into_iter().filter(|t| t.kind == kind).collect())
+    }
+
+    /// Open ideas on projects' own ideas lists (not the general one), most recently active project first.
+    pub fn project_ideas(&self) -> Result<Vec<ProjectIdea>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.id, t.project_id, t.kind, t.text, t.done, t.position, t.created_at, t.done_at, p.slug, p.name, p.status
+             FROM tasks t JOIN projects p ON p.id = t.project_id
+             WHERE t.kind = 'idea' AND t.done = 0 AND p.slug != ?1
+             ORDER BY p.updated_at DESC, p.id, t.position, t.id",
+        )?;
+        let rows = st
+            .query_map([IDEAS_SLUG], |r| {
+                Ok(ProjectIdea { idea: task_row(r)?, project_slug: r.get(8)?, project_name: r.get(9)?, project_status: r.get(10)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -591,14 +666,25 @@ impl Db {
             .ok_or_else(|| Error::NotFound(format!("no task with id {id}")))
     }
 
+    /// Adds a task (an idea on the ideas list).
     pub fn add_task(&self, project_id: i64, text: &str) -> Result<Task> {
-        let text = non_empty(text, "a task")?;
-        self.project_by_id(project_id)?;
+        self.add_item(project_id, text, "task")
+    }
+
+    /// Adds an idea to a project's own ideas list (or the general one).
+    pub fn add_idea(&self, project_id: i64, text: &str) -> Result<Task> {
+        self.add_item(project_id, text, "idea")
+    }
+
+    fn add_item(&self, project_id: i64, text: &str, kind: &str) -> Result<Task> {
+        let text = non_empty(text, if kind == "idea" { "an idea" } else { "a task" })?;
+        let p = self.project_by_id(project_id)?;
+        let kind = list_kind(&p.slug).unwrap_or(kind);
         let pos: i64 =
             self.conn.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM tasks WHERE project_id = ?1", [project_id], |r| r.get(0))?;
         self.conn.execute(
-            "INSERT INTO tasks (project_id, text, position, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, text, pos, now()],
+            "INSERT INTO tasks (project_id, kind, text, position, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, kind, text, pos, now()],
         )?;
         self.touch(project_id)?;
         self.task(self.conn.last_insert_rowid())
@@ -612,24 +698,39 @@ impl Db {
         };
         let done = patch.done.unwrap_or(cur.done);
         let done_at = if done { cur.done_at.clone().or_else(|| Some(now())) } else { None };
+        let kind = match &patch.kind {
+            Some(k) => check_kind(k)?,
+            None => cur.kind.clone(),
+        };
+        if kind != cur.kind {
+            let p = self.project_by_id(cur.project_id)?;
+            if let Some(fixed) = list_kind(&p.slug).filter(|f| *f != kind) {
+                return Err(Error::Invalid(format!("everything on {} is a {fixed}: move it to a project instead", p.name)));
+            }
+        }
         self.conn.execute(
-            "UPDATE tasks SET text = ?1, done = ?2, done_at = ?3 WHERE id = ?4",
-            params![text, done as i64, done_at, id],
+            "UPDATE tasks SET text = ?1, done = ?2, done_at = ?3, kind = ?4 WHERE id = ?5",
+            params![text, done as i64, done_at, kind, id],
         )?;
         self.touch(cur.project_id)?;
         self.task(id)
     }
 
-    /// Moves a task to the end of another project's checklist. Both projects count it as activity.
+    /// Moves a task or idea to the end of another project's list. It stays what it is, except that
+    /// on the to-do list it becomes a task and on the ideas list an idea. Both projects count it as activity.
     pub fn move_task(&self, id: i64, project_id: i64) -> Result<Task> {
         let cur = self.task(id)?;
-        self.project_by_id(project_id)?;
+        let to = self.project_by_id(project_id)?;
         if cur.project_id == project_id {
             return Ok(cur);
         }
+        let kind = list_kind(&to.slug).unwrap_or(&cur.kind);
         let pos: i64 =
             self.conn.query_row("SELECT COALESCE(MAX(position), 0) + 1 FROM tasks WHERE project_id = ?1", [project_id], |r| r.get(0))?;
-        self.conn.execute("UPDATE tasks SET project_id = ?1, position = ?2 WHERE id = ?3", params![project_id, pos, id])?;
+        self.conn.execute(
+            "UPDATE tasks SET project_id = ?1, position = ?2, kind = ?3 WHERE id = ?4",
+            params![project_id, pos, kind, id],
+        )?;
         self.touch(cur.project_id)?;
         self.touch(project_id)?;
         self.task(id)
@@ -703,10 +804,19 @@ impl Db {
                     }
                     out.push('\n');
                 }
-                let tasks = self.tasks(p.id)?;
+                let items = self.tasks(p.id)?;
+                let (ideas, tasks): (Vec<_>, Vec<_>) = items.iter().partition(|t| t.kind == "idea" && p.slug != IDEAS_SLUG);
                 if !tasks.is_empty() {
                     for t in &tasks {
                         out.push_str(&format!("- [{}] {}\n", if t.done { "x" } else { " " }, t.text));
+                    }
+                    out.push('\n');
+                }
+                let ideas: Vec<_> = ideas.iter().filter(|t| !t.done).collect();
+                if !ideas.is_empty() {
+                    out.push_str("Ideas:\n");
+                    for t in ideas {
+                        out.push_str(&format!("- {}\n", t.text));
                     }
                     out.push('\n');
                 }
@@ -831,5 +941,61 @@ mod tests {
         assert_eq!(db.move_task(t.id, p.id).unwrap().position, 2, "moving to the same place is a no-op");
         assert!(matches!(db.move_task(t.id, 9999), Err(Error::NotFound(_))));
         assert_eq!(db.move_task(t.id, ideas.id).unwrap().project_id, ideas.id);
+    }
+
+    #[test]
+    fn upgrade_makes_the_ideas_list_ideas() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'personal', status TEXT NOT NULL DEFAULT 'active', summary TEXT NOT NULL DEFAULT '',
+                next_step TEXT NOT NULL DEFAULT '', links TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE notes (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'note',
+                body TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'web', created_at TEXT NOT NULL, edited_at TEXT);
+            CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, text TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL, created_at TEXT NOT NULL, done_at TEXT);
+            INSERT INTO projects VALUES (1, 'ideas', 'Ideas', 'personal', 'active', '', '', '', 'x', 'x');
+            INSERT INTO projects VALUES (2, 'learn-blender', 'Learn Blender', 'personal', 'active', '', '', '', 'x', 'x');
+            INSERT INTO tasks (project_id, text, position, created_at) VALUES (1, 'Learn to juggle', 1, 'x'), (2, 'Model the mug', 1, 'x');
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.tasks(1).unwrap()[0].kind, "idea");
+        assert_eq!(db.tasks(2).unwrap()[0].kind, "task");
+    }
+
+    #[test]
+    fn project_ideas() {
+        let db = Db::memory().unwrap();
+        let ideas = db.ensure_list(IDEAS_SLUG, "Sam", "test").unwrap();
+        let todo = db.ensure_list(TODO_SLUG, "Sam", "test").unwrap();
+        let p = db.create(new("Learn Blender", "personal"), "test").unwrap();
+        db.add_task(p.id, "Model the mug").unwrap();
+        let i = db.add_idea(p.id, "Animate the mug").unwrap();
+        assert_eq!(i.kind, "idea");
+        assert_eq!(db.add_task(ideas.id, "Learn to juggle").unwrap().kind, "idea", "the ideas list holds ideas");
+        let p = db.project_by_id(p.id).unwrap();
+        assert_eq!((p.tasks_total, p.ideas_open), (1, 1), "ideas aren't counted as tasks");
+        let d = db.detail(&p, 0).unwrap();
+        assert_eq!((d.tasks.len(), d.ideas.len()), (1, 1));
+        let elsewhere = db.project_ideas().unwrap();
+        assert_eq!(elsewhere.len(), 1, "the general list isn't included");
+        assert_eq!((elsewhere[0].project_slug.as_str(), elsewhere[0].idea.text.as_str()), ("learn-blender", "Animate the mug"));
+
+        // Moving: the general ideas list makes it an idea, the to-do list a task; projects keep it as it is.
+        assert_eq!(db.move_task(i.id, ideas.id).unwrap().kind, "idea");
+        assert_eq!(db.move_task(i.id, p.id).unwrap().kind, "idea");
+        assert_eq!(db.move_task(i.id, todo.id).unwrap().kind, "task");
+        assert_eq!(db.move_task(i.id, p.id).unwrap().kind, "task");
+
+        // Turning one into the other, except on the built-in lists.
+        let t = db.update_task(i.id, TaskPatch { kind: Some("Idea".into()), ..Default::default() }).unwrap();
+        assert_eq!(t.kind, "idea");
+        assert!(db.update_task(i.id, TaskPatch { kind: Some("thing".into()), ..Default::default() }).is_err());
+        let j = db.add_task(ideas.id, "Write a novel").unwrap();
+        assert!(db.update_task(j.id, TaskPatch { kind: Some("task".into()), ..Default::default() }).is_err());
+        let md = db.export_markdown(3, "CatApp").unwrap();
+        assert!(md.contains("Ideas:\n- Animate the mug") && md.contains("- [ ] Write a novel"));
     }
 }

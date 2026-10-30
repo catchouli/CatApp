@@ -134,8 +134,9 @@ async function renderHome() {
   // The built-in lists (to-do, ideas) are projects shown as panels, not cards. Adding to one
   // that doesn't exist yet makes it.
   const lists = await Promise.all(LISTS.map(l => allProjects.some(p => p.slug === l.slug)
-    ? api('GET', `/api/projects/${l.slug}`) : { slug: l.slug, tasks: [] }));
+    ? api('GET', `/api/projects/${l.slug}`) : { slug: l.slug, tasks: [], ideas: [] }));
   const projects = allProjects.filter(p => !LIST_SLUGS.includes(p.slug));
+  lists[LIST_SLUGS.indexOf(IDEAS_SLUG)].inProjects = projects.reduce((n, p) => n + p.ideas_open, 0);
   const filter = pref.filter || 'all';
   const showFinished = !!pref.showFinished;
   const cats = catOrder([...new Set(projects.map(p => p.category))]);
@@ -210,16 +211,18 @@ async function renderHome() {
 
 // ---- to-do and ideas lists ---------------------------------------------------------
 
-const TODO_SLUG = 'todo';
+const TODO_SLUG = 'todo', IDEAS_SLUG = 'ideas';
+// `items`: which of the list's items it shows (everything on the ideas list is an idea).
 const LISTS = [
-  { slug: TODO_SLUG, title: 'To do', shown: 8, add: 'Add a to-do', empty: 'Nothing to do. Nice.' },
-  { slug: 'ideas', title: 'Ideas', shown: 5, add: 'Add an idea', empty: 'Nothing yet. Jot ideas down here so they don\'t get lost.' },
+  { slug: TODO_SLUG, items: 'tasks', title: 'To do', shown: 8, add: 'Add a to-do', empty: 'Nothing to do. Nice.' },
+  { slug: IDEAS_SLUG, items: 'ideas', title: 'Ideas', shown: 5, add: 'Add an idea', empty: 'Nothing yet. Jot ideas down here so they don\'t get lost.' },
 ];
 const LIST_SLUGS = LISTS.map(l => l.slug);
 
 function listPanel(l, list) {
-  const allOpen = (pref.newestTasksFirst ? [...list.tasks].reverse() : list.tasks).filter(t => !t.done);
-  const done = list.tasks.length - allOpen.length;
+  const items = list[l.items];
+  const allOpen = (pref.newestTasksFirst ? [...items].reverse() : items).filter(t => !t.done);
+  const done = items.length - allOpen.length;
   const open = allOpen.slice(0, l.shown);
   const more = allOpen.length - open.length;
   const all = `#/p/${l.slug}`;
@@ -232,6 +235,7 @@ function listPanel(l, list) {
           <span class="t" title="Tap to expand">${rich(t.text)}</span>
           ${moveButton(t)}
         </li>`).join('')}</ul>${more ? `<p class="hint" style="margin:0 0 10px"><a href="${all}">+ ${more} more</a></p>` : ''}` : `<p class="empty">${esc(l.empty)}</p>`}
+      ${list.inProjects ? `<p class="hint" style="margin:0 0 10px"><a href="${all}">+ ${list.inProjects} in projects</a></p>` : ''}
       <form class="row" data-listadd><input placeholder="${esc(l.add)}" aria-label="${esc(l.add)}" style="flex:1;min-width:0"><button>Add</button></form>
     </div>`;
 }
@@ -248,7 +252,7 @@ function wireList(l, list) {
     toast('Done ✓');
     renderHome();
   }));
-  wireMoves(panel, list, renderHome);
+  wireMoves(panel, list[l.items], l.slug, renderHome);
   const form = panel.querySelector('[data-listadd]');
   form.onsubmit = e => {
     e.preventDefault();
@@ -265,12 +269,19 @@ function wireList(l, list) {
 // ---- moving a task to another project or list ------------------------------------------
 
 const moveIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 12h13M12 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const ideaIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const taskIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M5 4h14v16H5zM9 12l2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+// Turns a task into an idea on the same project, or back.
+const kindButton = t => t.kind === 'idea'
+  ? `<button class="ghost x" data-kind="task" data-id="${t.id}" aria-label="Make it a task" title="Make it a task">${taskIcon}</button>`
+  : `<button class="ghost x" data-kind="idea" data-id="${t.id}" aria-label="Make it an idea" title="Not now: make it an idea">${ideaIcon}</button>`;
 const moveButton = t => `<button class="ghost x" data-move="${t.id}" aria-label="Move to another project" title="Move to another project">${moveIcon}</button>`;
 
-function wireMoves(root, project, after) {
+// `items`: the tasks and ideas the buttons are for. Ideas gathered from several projects say which they're on.
+function wireMoves(root, items, from, after) {
   root.querySelectorAll('[data-move]').forEach(b => b.onclick = () => {
-    const t = project.tasks.find(x => String(x.id) === b.dataset.move);
-    if (t) openMove(t, project.slug, after);
+    const t = items.find(x => String(x.id) === b.dataset.move);
+    if (t) openMove(t, t.project_slug || from, after);
   });
 }
 
@@ -325,6 +336,7 @@ function card(p) {
       ${p.next_step ? `<div class="next">Next: ${esc(p.next_step)}</div>` : ''}
       <div class="meta">
         ${p.tasks_total ? `<span class="bar" aria-hidden="true"><i style="width:${pct}%"></i></span><span>${p.tasks_done}/${p.tasks_total} tasks</span>` : ''}
+        ${p.ideas_open ? `<span>${p.ideas_open} idea${p.ideas_open === 1 ? '' : 's'}</span>` : ''}
         ${p.note_count ? `<span>${p.note_count} note${p.note_count === 1 ? '' : 's'}</span>` : ''}
         <span title="${esc(fullTime(p.last_activity))}">${ago(p.last_activity)}</span>
       </div>
@@ -343,6 +355,21 @@ async function renderProject(slug) {
   const pick = { all: () => true, mine: n => !isAgent(n) && n.kind === 'note', agents: isAgent };
   const counts = { mine: p.notes.filter(pick.mine).length, agents: p.notes.filter(pick.agents).length };
   const notes = p.notes.filter(pick[logFilter] || pick.all);
+  // The built-in lists hold only tasks (to do) or only ideas; the ideas list also shows the ideas on projects.
+  const isList = LIST_SLUGS.includes(p.slug);
+  const elsewhere = p.slug === IDEAS_SLUG ? await api('GET', '/api/ideas') : [];
+  const ordered = items => (newestFirst ? [...items].reverse() : items).filter(t => showDone || !t.done);
+  const ideasDone = p.ideas.filter(t => t.done).length;
+  const orderButton = n => n > 1 ? `<button class="ghost" data-taskorder aria-pressed="${newestFirst}" title="Change the order">${newestFirst ? 'Newest first' : 'Oldest first'}</button>` : '';
+  const doneButton = n => n ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${n})`}</button>` : '';
+  const itemRow = t => `
+    <li class="${t.done ? 'done' : ''}">
+      <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
+      <span class="t">${rich(t.text)}</span>
+      ${isList ? '' : kindButton(t)}
+      ${moveButton(t)}
+      <button class="ghost x" data-deltask="${t.id}" aria-label="Delete">✕</button>
+    </li>`;
 
   app.innerHTML = `
     <a class="back" href="#/">← All projects</a>
@@ -377,18 +404,33 @@ async function renderProject(slug) {
           </li>`).join('') || ''}</ul>
       </section>
 
+      ${p.slug === IDEAS_SLUG ? '' : `
       <section class="panel a-tasks">
-        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${p.tasks_total > 1 ? `<button class="ghost" data-taskorder aria-pressed="${newestFirst}" title="Change task order">${newestFirst ? 'Newest first' : 'Oldest first'}</button>` : ''}${p.tasks_done ? ` <button class="ghost" data-showdone aria-pressed="${showDone}">${showDone ? 'Hide done' : `Show done (${p.tasks_done})`}</button>` : ''}</span></h2>
+        <h2><span>Tasks ${p.tasks_total ? `<span class="hint">${p.tasks_done}/${p.tasks_total}</span>` : ''}</span><span>${orderButton(p.tasks_total)}${doneButton(p.tasks_done)}</span></h2>
         ${!showDone && p.tasks_total && p.tasks_total === p.tasks_done ? `<p class="empty">All done.</p>` : ''}
-        <ul class="tasks">${(newestFirst ? [...p.tasks].reverse() : p.tasks).filter(t => showDone || !t.done).map(t => `
-          <li class="${t.done ? 'done' : ''}">
-            <input type="checkbox" data-task="${t.id}" ${t.done ? 'checked' : ''} aria-label="${esc(t.text)}">
-            <span class="t">${rich(t.text)}</span>
-            ${moveButton(t)}
-            <button class="ghost x" data-deltask="${t.id}" aria-label="Delete task">✕</button>
-          </li>`).join('')}</ul>
-        <form id="task-form" class="row"><input id="task" placeholder="Add a task" aria-label="New task" style="flex:1;min-width:0"><button>Add</button></form>
-      </section>
+        <ul class="tasks">${ordered(p.tasks).map(itemRow).join('')}</ul>
+        <form class="row" data-add="tasks"><input placeholder="Add a task" aria-label="New task" style="flex:1;min-width:0"><button>Add</button></form>
+      </section>`}
+
+      ${p.slug === TODO_SLUG ? '' : `
+      <section class="panel a-ideas">
+        <h2><span>Ideas ${p.ideas_open ? `<span class="hint">${p.ideas_open}</span>` : ''}</span><span>${p.slug === IDEAS_SLUG ? orderButton(p.ideas.length) : ''}${doneButton(ideasDone)}</span></h2>
+        ${p.ideas_open || showDone && ideasDone ? '' : `<p class="empty">${isList ? 'No general ideas yet.' : 'Things to maybe do some day.'}</p>`}
+        <ul class="tasks">${ordered(p.ideas).map(itemRow).join('')}</ul>
+        <form class="row" data-add="ideas"><input placeholder="Add an idea" aria-label="New idea" style="flex:1;min-width:0"><button>Add</button></form>
+        ${elsewhere.length ? `
+        <h3 class="sub-title">In projects</h3>
+        ${[...new Set(elsewhere.map(i => i.project_slug))].map(slug => {
+          const group = elsewhere.filter(i => i.project_slug === slug);
+          return `<p class="idea-project"><a href="#/p/${encodeURIComponent(slug)}">${esc(group[0].project_name)}</a></p>
+            <ul class="tasks">${group.map(t => `
+              <li>
+                <input type="checkbox" data-task="${t.id}" aria-label="${esc(t.text)}">
+                <span class="t">${rich(t.text)}</span>
+                ${moveButton(t)}
+              </li>`).join('')}</ul>`;
+        }).join('')}` : ''}
+      </section>`}
 
       <section class="panel a-details">
         <h2>Details <button class="ghost" data-edit="details">Edit</button></h2>
@@ -480,30 +522,33 @@ async function renderProject(slug) {
   });
 
   // Tasks
-  const sd = app.querySelector('[data-showdone]');
-  if (sd) sd.onclick = () => { pref.showDoneTasks = !showDone; savePref(); renderProject(p.slug); };
-  const to = app.querySelector('[data-taskorder]');
-  if (to) to.onclick = () => { pref.newestTasksFirst = !newestFirst; savePref(); renderProject(p.slug); };
+  app.querySelectorAll('[data-showdone]').forEach(b => b.onclick = () => { pref.showDoneTasks = !showDone; savePref(); renderProject(p.slug); });
+  app.querySelectorAll('[data-taskorder]').forEach(b => b.onclick = () => { pref.newestTasksFirst = !newestFirst; savePref(); renderProject(p.slug); });
   app.querySelectorAll('[data-task]').forEach(cb => cb.onchange = () => guard(async () => {
     await api('PATCH', `/api/tasks/${cb.dataset.task}`, { done: cb.checked });
     renderProject(p.slug);
   }));
-  wireMoves(app.querySelector('.a-tasks'), p, () => renderProject(p.slug));
+  wireMoves(app, [...p.tasks, ...p.ideas, ...elsewhere], p.slug, () => renderProject(p.slug));
+  app.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => guard(async () => {
+    await api('PATCH', `/api/tasks/${b.dataset.id}`, { kind: b.dataset.kind });
+    toast(b.dataset.kind === 'idea' ? 'Moved to ideas' : 'Moved to tasks');
+    renderProject(p.slug);
+  }));
   app.querySelectorAll('[data-deltask]').forEach(b => b.onclick = () => guard(async () => {
     await api('DELETE', `/api/tasks/${b.dataset.deltask}`);
     renderProject(p.slug);
   }));
-  document.getElementById('task-form').onsubmit = e => {
+  app.querySelectorAll('[data-add]').forEach(form => form.onsubmit = e => {
     e.preventDefault();
-    const inp = document.getElementById('task');
+    const inp = form.querySelector('input');
     if (!inp.value.trim()) return inp.focus();
     guard(async () => {
-      await api('POST', `${base}/tasks`, { text: inp.value });
+      await api('POST', `${base}/${form.dataset.add}`, { text: inp.value });
       inp.value = '';
       await renderProject(p.slug);
-      document.getElementById('task').focus();
+      app.querySelector(`[data-add="${form.dataset.add}"] input`).focus();
     });
-  };
+  });
 }
 
 // ---- new project ------------------------------------------------------------------
@@ -561,7 +606,7 @@ async function renderSearch(q) {
   const r = await api('GET', `/api/search?q=${encodeURIComponent(q)}`);
   const out = [];
   if (r.projects.length) out.push(`<h2>Projects</h2><div class="cards">${r.projects.map(card).join('')}</div>`);
-  if (r.tasks.length) out.push(`<h2>Tasks</h2><ul class="panel feed">${r.tasks.map(t => `<li>${t.done ? '✓ ' : ''}${rich(t.text)}</li>`).join('')}</ul>`);
+  if (r.tasks.length) out.push(`<h2>Tasks</h2><ul class="panel feed">${r.tasks.map(t => `<li>${t.done ? '✓ ' : ''}${t.kind === 'idea' ? '<span class="hint">idea</span> ' : ''}${rich(t.text)}</li>`).join('')}</ul>`);
   if (r.notes.length) out.push(`<h2>Notes</h2><ul class="panel feed">${r.notes.map(n => `
     <li><div class="who"><a href="#/p/${encodeURIComponent(n.project_slug)}">${esc(n.project_name)}</a> · ${ago(n.created_at)}</div><div class="body">${rich(n.body)}</div></li>`).join('')}</ul>`);
   document.getElementById('sr').innerHTML = out.join('') || '<p class="empty" style="margin-top:16px">Nothing found.</p>';

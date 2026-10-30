@@ -44,10 +44,14 @@ Your data lives in `~/Library/Application Support/catapp/` on macOS and `~/.loca
 
 The project with slug `todo` is the general to-do list, and `ideas` is a list of things to maybe do some day. They show on the home page (to-dos first, eight items, then five ideas; tap one to expand, tick to finish) instead of as project cards. Each is made the first time you add to it.
 
+Every project has its own ideas too, under its tasks. The ideas page (the "all" link on the home-page panel) shows the general ideas and then each project's. Press the light bulb next to a task to turn it into an idea ("not now"), or the box next to an idea to make it a task. Moving keeps a task a task and an idea an idea, except that the to-do list makes it a task and the ideas list an idea.
+
 ```sh
 catapp todo                  # show open items
 catapp todo pay the gas bill # add one
-catapp idea learn to juggle  # add an idea (`catapp idea` lists them)
+catapp idea learn to juggle  # add an idea (`catapp idea` lists them, and the projects' ideas)
+catapp idea -p blender try geometry nodes  # add an idea to a project (`-p blender` alone lists them)
+catapp task to-idea 76       # turn a task into an idea (`to-task` turns one back)
 catapp task done 76          # tick one off
 catapp task mv 76 blender    # move it to a project (or to todo, ideas)
 ```
@@ -101,7 +105,8 @@ AI agents working in your repos can post short status notes to the matching proj
 | `catapp new "Name" -c work -n "first step"` | New project |
 | `catapp task add blender "thing"` / `task done 12` / `task undo 12` / `task mv 12 ideas` / `task rm 12` | Checklist |
 | `catapp todo` / `catapp todo "thing"` | The to-do list |
-| `catapp idea` / `catapp idea "thing"` | The ideas list |
+| `catapp idea` / `catapp idea "thing"` / `catapp idea -p blender "thing"` | The ideas list, or a project's ideas |
+| `catapp task to-idea 12` / `task to-task 12` | Turn a task into an idea, or back |
 | `catapp recent` / `catapp search word` | Latest notes / search everything |
 | `catapp export > snapshot.md` | Everything as Markdown |
 | `catapp config` | Settings: name, owner, icon, port, voice, speaker, persona, memory, avatar |

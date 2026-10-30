@@ -114,10 +114,14 @@ enum Cmd {
         #[arg(short, long)]
         all: bool,
     },
-    /// Your ideas list: `catapp idea` shows it, `catapp idea some thing` adds to it
+    /// Your ideas: `catapp idea` shows them, `catapp idea some thing` adds to the general list,
+    /// `-p <project>` shows or adds to a project's own ideas
     #[command(alias = "ideas")]
     Idea {
         text: Vec<String>,
+        /// A project's own ideas, instead of the general list
+        #[arg(short, long)]
+        project: Option<String>,
         /// Include done items
         #[arg(short, long)]
         all: bool,
@@ -165,8 +169,12 @@ enum TaskCmd {
     Done { id: i64 },
     /// Mark a task not done
     Undo { id: i64 },
-    /// Move a task to another project (or `todo`, `ideas`)
+    /// Move a task or idea to another project (or `todo`, `ideas`)
     Mv { id: i64, project: String },
+    /// Turn a task into an idea
+    ToIdea { id: i64 },
+    /// Turn an idea into a task
+    ToTask { id: i64 },
     /// Delete a task
     Rm { id: i64 },
 }
@@ -290,14 +298,42 @@ fn list_cmd(slug: &str, text: Vec<String>, all: bool, empty: &str) -> Result<(),
         return Ok(());
     }
     let tasks = db.tasks(p.id).map_err(|e| e.to_string())?;
-    let shown: Vec<_> = tasks.iter().filter(|t| all || !t.done).collect();
+    print_items(&tasks, all, empty);
+    if slug == IDEAS_SLUG {
+        let mut last = String::new();
+        for i in db.project_ideas().map_err(|e| e.to_string())? {
+            if i.project_slug != last {
+                println!("\n{} ({}):", i.project_name, i.project_slug);
+                last = i.project_slug.clone();
+            }
+            println!("  [ ] {}  (#{})", i.idea.text, i.idea.id);
+        }
+    }
+    Ok(())
+}
+
+/// `catapp idea -p <project>`: show a project's own ideas, or add to them.
+fn project_ideas_cmd(project: &str, text: Vec<String>, all: bool) -> Result<(), String> {
+    let db = open_db()?;
+    let p = db.find_or_list(project, &brand::Brand::load(&home()).owner, "cli").map_err(|e| e.to_string())?;
+    if !text.is_empty() {
+        let t = db.add_idea(p.id, &text.join(" ")).map_err(|e| e.to_string())?;
+        println!("Added idea #{} to {}: {}", t.id, p.name, t.text);
+        return Ok(());
+    }
+    let ideas = db.items(p.id, "idea").map_err(|e| e.to_string())?;
+    print_items(&ideas, all, &format!("No ideas on {} yet. Add one: catapp idea -p {} some thing", p.name, p.slug));
+    Ok(())
+}
+
+fn print_items(items: &[db::Task], all: bool, empty: &str) {
+    let shown: Vec<_> = items.iter().filter(|t| all || !t.done).collect();
     if shown.is_empty() {
         println!("{empty}");
     }
     for t in shown {
         println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
     }
-    Ok(())
 }
 
 fn json_out<T: serde::Serialize>(v: &T) {
@@ -405,6 +441,13 @@ fn run(cli: Cli) -> Result<(), String> {
                     println!("  [{}] {}  (#{})", if t.done { "x" } else { " " }, t.text, t.id);
                 }
             }
+            let ideas: Vec<_> = d.ideas.iter().filter(|t| !t.done).collect();
+            if !ideas.is_empty() {
+                println!("\nIdeas:");
+                for t in ideas {
+                    println!("  - {}  (#{})", t.text, t.id);
+                }
+            }
             if !d.notes.is_empty() {
                 println!("\nLog:");
                 for n in &d.notes {
@@ -446,8 +489,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 }
                 TaskCmd::Done { id } | TaskCmd::Undo { id } => {
                     let done = matches!(cmd, TaskCmd::Done { .. });
-                    let t = db.update_task(id, TaskPatch { done: Some(done), text: None }).map_err(e)?;
+                    let t = db.update_task(id, TaskPatch { done: Some(done), ..Default::default() }).map_err(e)?;
                     println!("[{}] {}", if t.done { "x" } else { " " }, t.text);
+                }
+                TaskCmd::ToIdea { id } | TaskCmd::ToTask { id } => {
+                    let kind = if matches!(cmd, TaskCmd::ToIdea { .. }) { "idea" } else { "task" };
+                    let t = db.update_task(id, TaskPatch { kind: Some(kind.into()), ..Default::default() }).map_err(e)?;
+                    println!("#{} is now {} {}: {}", t.id, if kind == "idea" { "an" } else { "a" }, kind, t.text);
                 }
                 TaskCmd::Mv { id, project } => {
                     let p = db.find_or_list(&project, &brand::Brand::load(&home()).owner, "cli").map_err(e)?;
@@ -461,7 +509,8 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         }
         Cmd::Todo { text, all } => list_cmd(TODO_SLUG, text, all, "Nothing to do. Add something: catapp todo buy milk")?,
-        Cmd::Idea { text, all } => list_cmd(IDEAS_SLUG, text, all, "No ideas yet. Add one: catapp idea learn to juggle")?,
+        Cmd::Idea { text, project: Some(project), all } => project_ideas_cmd(&project, text, all)?,
+        Cmd::Idea { text, project: None, all } => list_cmd(IDEAS_SLUG, text, all, "No ideas yet. Add one: catapp idea learn to juggle")?,
         Cmd::Recent { limit, category } => {
             let db = open_db()?;
             let cat = category.as_deref().map(db::norm_category);

@@ -201,13 +201,16 @@ dialog#move[open] { display: flex; flex-direction: column; }
 .proj-head .sub { color: var(--muted); font-size: 14px; margin-top: 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .project {
   display: grid; gap: 16px;
-  grid-template-areas: "next" "notes" "tasks" "details";
+  grid-template-areas: "next" "notes" "tasks" "ideas" "details";
 }
 .project > * { margin: 0 !important; }
-.a-next { grid-area: next; } .a-notes { grid-area: notes; } .a-tasks { grid-area: tasks; } .a-details { grid-area: details; }
+.a-next { grid-area: next; } .a-notes { grid-area: notes; } .a-tasks { grid-area: tasks; } .a-ideas { grid-area: ideas; } .a-details { grid-area: details; }
 @media (min-width: 900px) {
-  .project { grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-areas: "next notes" "tasks notes" "details notes"; align-items: start; }
-  .a-notes { grid-row: 1 / span 3; }
+  /* The left column stacks at the top; the last row soaks up the rest of the log's height. */
+  .project {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); grid-template-rows: repeat(4, auto) 1fr;
+    grid-template-areas: "next notes" "tasks notes" "ideas notes" "details notes" ". notes"; align-items: start;
+  }
 }
 .nextstep { font-size: 17px; font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
 .empty { color: var(--faint); font-style: italic; }
@@ -224,6 +227,10 @@ dialog#move[open] { display: flex; flex-direction: column; }
 @media (hover: none) { .tasks .x { opacity: 1; } }
 
 .log { list-style: none; margin: 16px 0 0; padding: 0; }
+/* The log scrolls inside its panel instead of making the page long. Room on the left for the agent stripe. */
+.a-notes .log { max-height: min(60vh, 640px); overflow: hidden auto; margin-left: -13px; padding-left: 13px; overscroll-behavior: contain; }
+.sub-title { font-size: 14px; color: var(--muted); margin: 18px 0 6px; font-weight: 600; }
+.idea-project { margin: 8px 0 0; font-size: 14px; }
 .log li { padding: 12px 0; border-top: 1px solid var(--border); }
 .log .when { font-size: 13px; color: var(--muted); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .log .when .actions { margin-left: auto; display: flex; gap: 2px; }
