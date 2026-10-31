@@ -39,7 +39,7 @@ catapp config owner Sam         # your first name, for the assistant
 catapp service install          # keep it running in the background
 ```
 
-Open <http://localhost:8787>. For your phone, run `catapp url` and scan the QR code.
+Run `catapp url` and open the link it prints: each browser needs the access token once, this computer's too. For your phone, scan the QR code.
 
 From a terminal it's things like `catapp todo "pay the gas bill"`,
 `catapp note blender "finished the donut"` and `catapp ls`.

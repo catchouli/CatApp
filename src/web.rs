@@ -1,12 +1,13 @@
 //! The web app: a JSON API plus a small single-page front end, embedded in
-//! the binary. Requests from this Mac are trusted; anything else (your
-//! phone) needs the access token once, which is then kept in a cookie.
+//! the binary. Every browser, this computer's included, needs the access token
+//! once, which is then kept in a cookie. Requests from this computer aren't
+//! trusted on their own: a web page can reach localhost too (DNS rebinding).
 
 use crate::brand::Brand;
 use crate::db::{self, Db, NewProject, ProjectPatch, TaskPatch};
 use crate::voice::Voice;
 use axum::body::Bytes;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -14,7 +15,6 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -143,10 +143,7 @@ fn query_token(uri: &Uri) -> Option<String> {
     uri.query()?.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == "token").map(|(_, v)| v.to_string())
 }
 
-async fn auth(State(st): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
-    if addr.ip().is_loopback() {
-        return next.run(req).await;
-    }
+async fn auth(State(st): St, req: Request, next: Next) -> Response {
     // A link with ?token=... logs this browser in and drops the token from the address bar.
     if let Some(t) = query_token(req.uri()) {
         if ct_eq(&t, &st.token) {
@@ -426,10 +423,16 @@ pub(crate) fn claude_command(home: &std::path::Path, brand: &Brand, prompt: &str
     Ok(cmd)
 }
 
-/// A session id from the browser, checked before it goes on a command line.
+/// A session id from the browser, checked before it goes on a command line: it must be a UUID
+/// (8-4-4-4-12 hex digits), so it can never look like a flag.
 pub(crate) fn session_id(s: Option<&str>) -> Result<Option<String>, db::Error> {
+    let uuid = |s: &str| {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && parts.iter().zip([8, 4, 4, 4, 12]).all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
+    };
     match s.filter(|s| !s.is_empty()) {
-        Some(s) if s.chars().all(|c| c.is_ascii_hexdigit() || c == '-') => Ok(Some(s.to_string())),
+        Some(s) if uuid(s) => Ok(Some(s.to_string())),
         Some(_) => Err(db::Error::Invalid("bad session id".into())),
         None => Ok(None),
     }
@@ -578,5 +581,21 @@ async fn avatar_file(State(st): St, Path(path): Path<String>) -> Result<Response
 pub async fn serve(state: Arc<AppState>, bind: &str, port: u16) -> std::io::Result<()> {
     state.voice.clone().reap_idle();
     let listener = tokio::net::TcpListener::bind((bind, port)).await?;
-    axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await
+    axum::serve(listener, router(state)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_id;
+
+    #[test]
+    fn session_ids_must_be_uuids() {
+        let ok = "0f8b6c1e-2d3a-4b5c-9e7f-a1b2c3d4e5f6";
+        assert_eq!(session_id(Some(ok)).unwrap().as_deref(), Some(ok));
+        assert_eq!(session_id(None).unwrap(), None);
+        assert_eq!(session_id(Some("")).unwrap(), None);
+        for bad in ["-", "--", "-abc", "0f8b6c1e2d3a4b5c9e7fa1b2c3d4e5f6", "0f8b6c1e-2d3a-4b5c-9e7f-a1b2c3d4e5f6-", "0f8b6c1e-2d3a-4b5c-9e7f-a1b2c3d4e5fg"] {
+            assert!(session_id(Some(bad)).is_err(), "{bad}");
+        }
+    }
 }

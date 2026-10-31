@@ -34,7 +34,7 @@ enum Cmd {
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
     },
-    /// Print the address (with access token and QR code) to open on your phone
+    /// Print the links (with the access token, and a QR code for your phone) to open the web app
     Url {
         /// Default: the `port` setting
         #[arg(long)]
@@ -201,10 +201,21 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("catapp"))
 }
 
-fn open_db() -> Result<Db, String> {
+/// The data folder, created if need be and kept readable by its owner only: it holds the
+/// database and the access token.
+fn data_dir() -> Result<PathBuf, String> {
     let dir = home();
     std::fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
-    Db::open(&dir.join("catapp.db")).map_err(|e| e.to_string())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
+fn open_db() -> Result<Db, String> {
+    Db::open(&data_dir()?.join("catapp.db")).map_err(|e| e.to_string())
 }
 
 /// The web app's access token, made on first use.
@@ -217,8 +228,13 @@ fn token() -> Result<String, String> {
     }
     use rand::Rng;
     let t: String = rand::thread_rng().sample_iter(rand::distributions::Alphanumeric).take(32).map(char::from).collect();
-    std::fs::create_dir_all(home()).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &t).map_err(|e| e.to_string())?;
+    data_dir()?;
+    // Created owner-only from the start, so it's never readable by others, even briefly.
+    let mut f = std::fs::OpenOptions::new();
+    f.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
+    std::io::Write::write_all(&mut f.open(&path).map_err(|e| e.to_string())?, t.as_bytes()).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -366,13 +382,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 voice: Default::default(),
             });
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            println!("{} on http://localhost:{port}  (run `catapp url` for the phone address)", brand::Brand::load(&home()).name);
+            println!("{} on http://localhost:{port}  (run `catapp url` for links with the access token)", brand::Brand::load(&home()).name);
             rt.block_on(web::serve(state, &bind, port)).map_err(|e| format!("can't serve on {bind}:{port}: {e}"))?;
         }
         Cmd::Url { port } => {
             let port = port.unwrap_or(brand::Brand::load(&home()).port);
             let t = token()?;
-            println!("On this computer: http://localhost:{port}");
+            println!("On this computer: http://localhost:{port}/?token={t}");
             let mut phone = None;
             if let Some(h) = local_hostname() {
                 let u = format!("http://{h}:{port}/?token={t}");

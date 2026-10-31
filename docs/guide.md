@@ -21,7 +21,7 @@ Everything about setting up, configuring and using CatApp. The [README](../READM
    ```sh
    catapp service install
    ```
-5. **Open it:** <http://localhost:8787> on the computer running it. For your phone, run `catapp url` and scan the QR code or open the link (same Wi-Fi). Opening the link once logs that browser in for a year. In Safari, Share > Add to Home Screen makes it feel like an app.
+5. **Open it:** run `catapp url` and open the "On this computer" link. For your phone, scan the QR code or open its link (same Wi-Fi). Opening a link once logs that browser in for a year; every browser needs it once, even on the computer running the app, so a web page can't reach your data through localhost. In Safari, Share > Add to Home Screen makes it feel like an app.
 6. **Optional: the assistant.** Install [Claude Code](https://claude.com/claude-code) on the same computer and log in once (run `claude` in a terminal). Then the **Ask** button works. Without it, everything else still works, and Ask explains what's missing.
 
 Your data lives in `~/Library/Application Support/catapp/` on macOS and `~/.local/share/catapp/` on Linux: `catapp.db`, the access `token`, `config.json` and a log. Each person's copy is completely separate.

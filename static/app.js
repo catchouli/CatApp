@@ -1171,9 +1171,15 @@ speakBtn.onclick = () => {
 
 // ---- avatar: a Live2D model whose mouth follows the voice ---------------------------
 
-function loadScript(src) {
+// Scripts from a CDN carry a hash, so the browser refuses them if they've been changed: they'd
+// run with full access to the page, unlocked private projects included.
+function loadScript(src, integrity) {
   return new Promise((ok, fail) => {
     const s = document.createElement('script');
+    if (integrity) {
+      s.integrity = integrity;
+      s.crossOrigin = 'anonymous';
+    }
     s.src = src;
     s.onload = ok;
     s.onerror = () => fail(new Error(`couldn't load ${src}`));
@@ -1183,8 +1189,10 @@ function loadScript(src) {
 
 async function loadAvatar(url) {
   await loadScript('/avatar/live2dcubismcore.min.js');
-  await loadScript('https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js');
-  await loadScript('https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js');
+  await loadScript('https://cdn.jsdelivr.net/npm/pixi.js@6.5.10/dist/browser/pixi.min.js',
+    'sha384-98eYPI3XO3wKMBW5IUYk3WpffOsMLc+0WSK+ZMutD8S5R6e4E7hKIqFKcdHBLOMB');
+  await loadScript('https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js',
+    'sha384-x73Ez+8Lf2UpkuWDPMvQ/T8scXzifx3geDffp4EdBI2/r/z+NlTxlHA5xySHOP7n');
   const el = document.getElementById('ask-avatar');
   el.hidden = false;
   document.body.classList.add('voice-avatar');
