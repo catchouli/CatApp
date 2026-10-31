@@ -199,6 +199,13 @@ const PROJECT_SELECT: &str = "SELECT p.id, p.slug, p.name, p.category, p.status,
 const NOTE_SELECT: &str = "SELECT n.id, n.project_id, p.slug, p.name, p.category, n.kind, n.body, n.source,
     n.created_at, n.edited_at FROM notes n JOIN projects p ON p.id = n.project_id";
 
+/// The schema version `Db::migrate` brings a database up to.
+const SCHEMA_VERSION: i64 = 4;
+
+fn user_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
 const TASK_SELECT: &str = "SELECT id, project_id, kind, text, done, position, created_at, done_at, wont_do_at FROM tasks";
 
 /// What a checklist item can be.
@@ -336,13 +343,24 @@ impl Db {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Db> {
+    fn init(mut conn: Connection) -> Result<Db> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if user_version(&conn)? < SCHEMA_VERSION {
+            Self::migrate(&mut conn)?;
+        }
+        Ok(Db { conn, private: false })
+    }
+
+    /// Brings an older database up to date in one transaction. The write lock is taken first and the
+    /// version read again under it, so when two processes open an old file at once, the second waits
+    /// for the first, sees the new version and has nothing left to do.
+    fn migrate(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version = user_version(&tx)?;
         if version < 1 {
-            conn.execute_batch(
+            tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS projects (
                     id INTEGER PRIMARY KEY,
                     slug TEXT NOT NULL UNIQUE,
@@ -373,39 +391,29 @@ impl Db {
                     position INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     done_at TEXT
-                );
-                PRAGMA user_version = 1;",
+                );",
             )?;
         }
         if version < 2 {
             // Checklist items become tasks or ideas; the ideas list's items are ideas.
-            conn.execute_batch(&format!(
-                "BEGIN;
-                ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
-                UPDATE tasks SET kind = 'idea' WHERE project_id IN (SELECT id FROM projects WHERE slug = '{IDEAS_SLUG}');
-                PRAGMA user_version = 2;
-                COMMIT;"
+            tx.execute_batch(&format!(
+                "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
+                UPDATE tasks SET kind = 'idea' WHERE project_id IN (SELECT id FROM projects WHERE slug = '{IDEAS_SLUG}');"
             ))?;
         }
         if version < 3 {
             // Private projects, and somewhere to keep the salt and check value for their passphrase.
-            conn.execute_batch(
-                "BEGIN;
-                ALTER TABLE projects ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                PRAGMA user_version = 3;
-                COMMIT;",
+            tx.execute_batch(
+                "ALTER TABLE projects ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
             )?;
         }
         if version < 4 {
-            conn.execute_batch(
-                "BEGIN;
-                ALTER TABLE tasks ADD COLUMN wont_do_at TEXT;
-                PRAGMA user_version = 4;
-                COMMIT;",
-            )?;
+            tx.execute_batch("ALTER TABLE tasks ADD COLUMN wont_do_at TEXT;")?;
         }
-        Ok(Db { conn, private: false })
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Lets this connection see private projects. For the web app only.
@@ -701,22 +709,28 @@ impl Db {
     /// encrypted, so they're never searched.
     pub fn search(&self, q: &str) -> Result<(Vec<Project>, Vec<Note>, Vec<Task>)> {
         let q = non_empty(q, "a search")?.to_lowercase();
+        // Everything is matched in Rust: SQLite's own lower() only lowercases A-Z, so a note saying
+        // "Call Émile" would never turn up for "émile".
+        let matches = |s: &str| s.to_lowercase().contains(&q);
         let projects = self
             .projects()?
             .into_iter()
             .filter(|p| !p.private)
-            .filter(|p| [&p.name, &p.summary, &p.next_step, &p.links].iter().any(|s| s.to_lowercase().contains(&q)))
+            .filter(|p| [&p.name, &p.summary, &p.next_step, &p.links].iter().any(|s| matches(s)))
             .collect();
-        let pat = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-        let mut st = self.conn.prepare(&format!(
-            "{NOTE_SELECT} WHERE lower(n.body) LIKE ?1 ESCAPE '\\' AND p.private = 0 ORDER BY n.created_at DESC LIMIT 50"
-        ))?;
-        let notes = st.query_map([&pat], note_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut st = self.conn.prepare(&format!(
-            "{TASK_SELECT} WHERE lower(text) LIKE ?1 ESCAPE '\\'
-             AND project_id IN (SELECT id FROM projects WHERE private = 0) LIMIT 50"
-        ))?;
-        let tasks = st.query_map([&pat], task_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut st = self.conn.prepare(&format!("{NOTE_SELECT} WHERE p.private = 0 ORDER BY n.created_at DESC"))?;
+        let notes = st
+            .query_map([], note_row)?
+            .filter(|n| n.as_ref().map_or(true, |n| matches(&n.body)))
+            .take(50)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut st =
+            self.conn.prepare(&format!("{TASK_SELECT} WHERE project_id IN (SELECT id FROM projects WHERE private = 0)"))?;
+        let tasks = st
+            .query_map([], task_row)?
+            .filter(|t| t.as_ref().map_or(true, |t| matches(&t.text)))
+            .take(50)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((projects, notes, tasks))
     }
 
@@ -1198,5 +1212,50 @@ mod tests {
         assert!(db.update_task(j.id, TaskPatch { kind: Some("task".into()), ..Default::default() }).is_err());
         let md = db.export_markdown(3, "CatApp").unwrap();
         assert!(md.contains("Ideas:\n- Animate the mug") && md.contains("- [ ] Write a novel"));
+    }
+
+    #[test]
+    fn search_folds_non_ascii_capitals() {
+        let db = Db::memory().unwrap();
+        let p = db.create(new("Visit Émile", "personal"), "test").unwrap();
+        db.add_note(p.id, "Call Émile about the ŁÓDŹ trip", "test").unwrap();
+        db.add_task(p.id, "Post Émile's card").unwrap();
+        for q in ["émile", "ÉMILE", "łódź"] {
+            let (ps, ns, ts) = db.search(q).unwrap();
+            let want = if q == "łódź" { (0, 1, 0) } else { (1, 1, 1) };
+            assert_eq!((ps.len(), ns.len(), ts.len()), want, "searching for {q}");
+        }
+        // LIKE wildcards are just text now.
+        assert_eq!(db.search("%").unwrap().1.len(), 0);
+    }
+
+    #[test]
+    fn two_openers_of_an_old_database_both_succeed() {
+        let dir = std::env::temp_dir().join(format!("catapp-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..10 {
+            // A database from before won't-do (version 3).
+            let path = dir.join(format!("{i}.db"));
+            drop(Db::open(&path).unwrap());
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch("ALTER TABLE tasks DROP COLUMN wont_do_at; PRAGMA user_version = 3;").unwrap();
+            drop(c);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let openers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (start, path) = (start.clone(), path.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        Db::open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+            for o in openers {
+                o.join().unwrap().unwrap();
+            }
+            let c = Connection::open(&path).unwrap();
+            assert_eq!(user_version(&c).unwrap(), SCHEMA_VERSION);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
